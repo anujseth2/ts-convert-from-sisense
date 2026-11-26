@@ -1,0 +1,1033 @@
+<!-- currency: thoughtspot — 2026-07 (2026-07-29 full sweep validated I1-I12, N1, PT1, EXC1 against 26.5-26.7 via the SpotterCode MCP; no contradictions found; I13 added and live-verified 2026-07-30 on se-thoughtspot — error_code 14516 on a dangling [formula_*] reference, BL-178/BL-183; I17-I19 added and live-verified 2026-10-21 on se-thoughtspot — join-graph error codes 13123/13124/13125/14565; I20-I21 2026-10-21 — 14528/14504; I22 2026-10-23 — RLS join cycle, from a support case's exported TML; I5 failure mode narrowed by type 2026-10-29, live probes on the SE demo cluster); I23 added 2026-11-12 — is_pre_aggregated_measure on AGGREGATE Table columns, live on the semantic SQL DEV cluster, import accepted on se-thoughtspot -->
+
+# ThoughtSpot Model Conversion Invariants
+
+Canonical hard rules for any skill that converts a source (Tableau / Snowflake SV /
+Databricks MV / …) into ThoughtSpot **Model TML**. Every "convert-from" skill MUST
+satisfy all invariants below. The `conversion-consistency-auditor` subagent checks
+skills against this file; keep the IDs (I1–I23, N1, EXC1) stable so the auditor can cite
+them without ambiguity.
+
+> Source skills that established these rules: `ts-convert-from-snowflake-sv` (I1–I4, I6–I7),
+> `ts-convert-from-databricks-mv` (I1–I7), and `ts-convert-from-tableau` (I9–I10, verified
+> 2026-06-19 against se-thoughtspot; I12, verified 2026-07-23 against se-thoughtspot; I13,
+> verified 2026-07-30 against se-thoughtspot).
+> They are proven against live ThoughtSpot imports; violations produce the failure modes
+> listed below.
+
+---
+
+## Invariants
+
+### I1 — Every formula has a paired `columns[]` entry
+
+**Rule:** For every entry in `formulas[]`, there must be a corresponding entry in
+`columns[]` that references it via `formula_id:`. An unpaired formula is **silently
+dropped** by ThoughtSpot on import — no error, no warning, no column in the model.
+
+**Failure mode:** Formula disappears from the model after import. User sees a model with
+fewer columns than expected, with no TML import error to diagnose.
+
+**Applies to:** All source dialects (Tableau, Snowflake SV, Databricks MV, …).
+
+**Correct pattern:**
+```yaml
+formulas:
+- id: formula_Total Sales           # id: "formula_" + name
+  name: "Total Sales"
+  expr: "sum ( [ORDERS::price] * [ORDERS::qty] )"
+  properties:
+    column_type: MEASURE
+
+columns:
+# ... physical columns first ...
+- name: "Total Sales"
+  formula_id: formula_Total Sales   # must match the formula's id exactly
+  properties:
+    column_type: MEASURE
+    aggregation: SUM
+    index_type: DONT_INDEX          # see I3
+```
+
+---
+
+### I2 — No `aggregation:` inside `formulas[]` entries
+
+**Rule:** Never add an `aggregation:` field to a `formulas[]` entry. Formulas are
+self-contained via their `expr`; `aggregation:` belongs only on `columns[]` entries.
+
+**Failure mode:** ThoughtSpot rejects the TML import with:
+`FORMULA is not a valid aggregation type`
+
+**Applies to:** All source dialects.
+
+**Correct (formula — no aggregation:):**
+```yaml
+formulas:
+- id: formula_Total Sales
+  name: "Total Sales"
+  expr: "sum ( [ORDERS::price] * [ORDERS::qty] )"
+  properties:
+    column_type: MEASURE
+    # NO aggregation: here
+```
+
+**Wrong (do NOT do this) — `aggregation:` on a formulas entry:**
+```yaml
+# Single formula entry — aggregation: on it triggers "FORMULA is not a valid aggregation type"
+- id: formula_Total Sales
+  name: "Total Sales"
+  expr: "sum ( [ORDERS::price] * [ORDERS::qty] )"
+  properties:
+    column_type: MEASURE
+    aggregation: SUM    # WRONG — remove this; keep aggregation: only on the columns[] entry
+```
+
+`aggregation:` on a `columns[]` formula entry *is* allowed, and every MEASURE formula
+column should declare one (product owner, 2026-11-02). It defines how the column rolls up
+only for a per-row formula and for a bare `group_aggregate` / `last_value` /
+`first_value`; on any other aggregate formula it is ignored (thoughtspot-model-tml.md has
+the table). The importer accepts it absent (`VALIDATE_ONLY`, 2026-11-04), so no lint rule
+enforces it. Where the source names none, the Power BI, Sisense and dbt converters declare
+it through `spotql_ops.formula_aggregation` (BL-509); the Snowflake SV, Databricks MV,
+Tableau and Qlik converters still declare their own (source or name-based) value, BL-519.
+Only the `formulas[]` entry must not carry it.
+
+---
+
+### I3 — `index_type: DONT_INDEX` on computed numeric measures
+
+**Rule:** Every `columns[]` entry that references a formula (i.e., has a `formula_id`)
+and is typed as a MEASURE should carry `index_type: DONT_INDEX`.
+
+**Failure mode:** ThoughtSpot may attempt to index the computed column, which is
+unnecessary for numeric measures and can produce unexpected search behaviour.
+
+**Applies to:** All source dialects.
+
+**Correct pattern:**
+```yaml
+columns:
+- name: "Total Sales"
+  formula_id: formula_Total Sales
+  properties:
+    column_type: MEASURE
+    aggregation: SUM
+    index_type: DONT_INDEX   # always on computed measures
+```
+
+---
+
+### I4 — Join `id` (when present) must equal `name` (exact case)
+
+**Rule:** `id` on a `model_tables[]` entry is optional. When present, it must be
+character-for-character identical to the `name` field. Omitting `id:` and referencing tables
+by `name:` alone (as the Tableau skill does) is simpler and equally correct. ThoughtSpot
+resolves `with:` and `on:` join references against the table's `name` — so if `id` is present
+but differs in case, joins silently fail.
+
+**Failure mode:** TML imports without error, but joins are broken at query time:
+`"{table_name} does not exist in schema"`
+
+**Applies to:** All source dialects.
+
+**Correct pattern:**
+```yaml
+model_tables:
+- id: FACT_ORDERS          # MUST equal name exactly — often uppercase
+  name: FACT_ORDERS        # exact ThoughtSpot table object name
+  fqn: "{guid}"
+  joins:
+  - with: DIM_CUSTOMERS    # must match the target entry's name exactly
+    referencing_join: "{join_name}"
+- id: DIM_CUSTOMERS        # MUST equal name exactly
+  name: DIM_CUSTOMERS
+  fqn: "{guid}"
+```
+
+**Wrong (do NOT do this):**
+```yaml
+model_tables:
+- id: fact_orders          # WRONG — lowercase id, uppercase name
+  name: FACT_ORDERS
+```
+
+---
+
+### I5 — COUNT-distinct as `unique count(...)` formula, never `COUNT_DISTINCT` aggregation
+
+**Rule:** Any distinct-count measure must be expressed as a `formulas[]` entry with
+`unique count ( [TABLE::col] )`. Never use `aggregation: COUNT_DISTINCT` on a `columns[]`
+entry that references a physical column, nor on a formula column whose `expr` is just a
+column reference (`[TABLE::col]`) — the probes below show the second fails the same way.
+
+**Failure mode:** depends on the column's data type, not on the aggregation.
+ThoughtSpot decides a physical column's role from its type: a `MEASURE` over a
+non-numeric column is silently stored as an `ATTRIBUTE`, whatever `aggregation` it
+carries. Live-probed 2026-10-29 on the SE demo cluster (three throwaway Models over a
+bank-customers Table, re-exported, the first also queried via `searchdata`, all deleted):
+
+| Physical column type | Aggregation tested | Stored `column_type` after import | Search returns |
+|---|---|---|---|
+| INT64 | `COUNT_DISTINCT` | `MEASURE` — kept | The distinct count (identical to the `unique count` formula) |
+| DOUBLE | `COUNT_DISTINCT` | `MEASURE` — kept | (not queried) |
+| VARCHAR | `COUNT_DISTINCT`, `COUNT`, `MIN` | `ATTRIBUTE` — **silently overridden** | `COUNT_DISTINCT`: the list of values, no count (others not queried) |
+| DATE | `COUNT_DISTINCT`, `MAX` | `ATTRIBUTE` — **silently overridden** | `COUNT_DISTINCT`: the list of values, no count (`MAX` not queried) |
+| VARCHAR, via a scalar formula `[T::col]` | `COUNT_DISTINCT` on the formula column | `ATTRIBUTE` — **silently overridden** | (not queried; the INT64 twin stayed `MEASURE`) |
+
+Not probed: INT32, FLOAT, BOOL, DATE_TIME, TIME. The formula row matters because a
+formula that only wraps a column, carrying `aggregation: COUNT_DISTINCT`, is the same
+failure. `ts tml lint` checks it since BL-447 (2026-11-08), following a chain of formulas
+that each only wrap the next; before that it exempted every formula column (audit
+2026-10-29 finding 9.1). An aggregate formula carrying `COUNT_DISTINCT` is not flagged,
+because ThoughtSpot ignores a formula measure's aggregation. "Numeric" and "non-numeric" below
+generalise from the rows above; BL-265 (a `COUNT` metric over a VARCHAR key, demoted the
+same way) is the same platform rule. Every import succeeds; nothing is reported. Text and
+date keys (string customer ids, order dates) are common distinct-count targets, so the
+silent case is the usual one.
+
+**Why the rule still forbids it on numeric columns.** The formula works for every data
+type, so one emission form needs no type lookup — a converter emitting it never has to
+know the column's type, and `ts tml lint` run on a Model file alone cannot see it either
+(with the Table TML in the same batch it could; that is not implemented). And the column
+form fails outright when the same physical
+column is also wanted as an attribute (`customer_id` as a field *and* a count): two
+`columns[]` entries sharing a `column_id` is a hard `duplicate column_id` rejection (I8).
+Before 2026-10-29 this section said the override applied to every column; that was never
+dated evidence and is wrong for numeric columns.
+
+**Exceptions (not converters):** a round-trip of a Model someone else authored may pass a
+numeric `COUNT_DISTINCT` column through unchanged (`thoughtspot-model-tml.md`), and
+`ts-link-*` emits one by design over numeric measures; `ts tml lint`'s I5 finding is advisory
+in both cases.
+
+**Temporary converter exception (dated 2026-10-29, ends with BL-447's dbt part):** `ts-convert-from-dbt`'s
+import lint gate reports I5 as advisory rather than blocking. A dbt `ts_aggregation: count_distinct`
+tag is often ThoughtSpot's own column round-tripped by ts-convert-to-dbt, and blocking would break
+builds that work today on numeric columns; converting it safely needs the existing Model read first
+(BL-447). Before that gate existed nothing was linted at all. It is also the one dated entry
+`check_converter_parity` requirement C carries (no from-converter maps a source aggregation to
+the literal `COUNT_DISTINCT`); the Snowflake SV, Power BI and Sisense hits were fixed on
+2026-11-08.
+
+**Not an I5 violation:** a column whose declared `column_type` is `ATTRIBUTE` carrying
+`aggregation: COUNT_DISTINCT` — there is no measure to demote, and ThoughtSpot's own exports carry
+exactly that pair after a demotion. `ts tml lint` and `check_tml.py` skip it.
+
+**Applies to:** All source dialects. `formula_common.unique_count_formula` is the shared
+spelling; today the Snowflake SV and Power BI builders emit through it (and both SV and
+Databricks MV duplicate-column promotion through `aggregate_formula`). Tableau, Qlik, Sisense,
+the Databricks MV translator and dbt MetricFlow still write `unique count` from their own
+function maps.
+- Tableau: `COUNTD(field)` → `unique count ( [TABLE::col] )` formula
+- Snowflake SV: `COUNT(DISTINCT col)` metrics → `unique count ( [TABLE::col] )` formula; a fact
+  whose Cortex Analyst `default_aggregation` is `count_distinct` → `unique count ( <row value> )`
+  in every fact form (BL-447)
+- Databricks MV: `COUNT(DISTINCT col)` → `unique count ( [TABLE::col] )` formula
+- Power BI: a `DISTINCTCOUNT` measure → a formula under the measure's own name; a column
+  whose `summarizeBy` is `distinctCount` stays an attribute under its own name and gains a
+  separate formula column `<column> (Distinct Count)` (BL-447).
+  Both count BLANK as a value, Approximated (BL-540); `DISTINCTCOUNTNOBLANK` → plain
+  `unique count`
+- Qlik: a measure that is exactly `Count(DISTINCT x)` → `unique count ( x )`. A
+  `Count(DISTINCT …)` nested inside a larger expression is not handled the same way yet
+- Sisense `count` (a distinct count in JAQL) → `unique count` formula
+- Looker `type: count_distinct` → `unique count()` formula, by the skill's instructions
+  (`lookml-tml-rules.md`); Looker ships no CLI module, so no code gate covers it
+- dbt `ts_aggregation: count_distinct` → still a column for now; the exception above
+
+**NULL is not counted.** `unique count` compiles to SQL `count(DISTINCT …)` (live-probed
+2026-11-08, BL-540: keys a, a, b, NULL, NULL, c gave 3). That matches SQL `COUNT(DISTINCT)`
+(Snowflake SV, Databricks MV, dbt), Tableau `COUNTD` (documented to ignore Null) and DAX
+`DISTINCTCOUNTNOBLANK`. DAX `DISTINCTCOUNT`, and a Power BI column summarised by
+`distinctCount`, count BLANK as one more value; they get the probed form
+`( unique count ( x ) + max ( if ( isnull ( x ) ) then 1 else 0 ) )` (4 on those keys),
+bracketed so it composes. It is **Approximated**, not exact: a dimension row with no
+matching facts is BLANK in DAX and 1 here, Power BI's blank row for unmatched relationship
+keys is not modelled, and it is unprobed inside `group_aggregate`.
+`formula_common.unique_count_formula(..., null_is_a_value=True)` writes it. Qlik
+`Count(DISTINCT …)` and Sisense `count` are believed to ignore NULL like SQL (Qlik has a
+separate `NullCount`) but neither was probed on its own platform.
+
+**Correct pattern:**
+```yaml
+formulas:
+- id: formula_Unique Customers
+  name: "Unique Customers"
+  expr: "unique count ( [ORDERS::customer_id] )"
+  properties:
+    column_type: MEASURE
+
+columns:
+- name: "Unique Customers"
+  formula_id: formula_Unique Customers
+  properties:
+    column_type: MEASURE
+    aggregation: SUM
+    index_type: DONT_INDEX
+```
+
+**Wrong (do NOT do this):**
+```yaml
+columns:
+- name: "Unique Customers"
+  column_id: ORDERS::customer_id
+  properties:
+    column_type: MEASURE
+    aggregation: COUNT_DISTINCT   # WRONG — flips to ATTRIBUTE on a non-numeric column; use the formula
+```
+
+---
+
+### I6 — Connections referenced by name, not GUID
+
+**Rule:** In all TML generated by conversion skills, the connection inside a `table:` or
+`sql_view:` block must use the `name:` field — never a GUID.
+
+**Failure mode:** GUIDs are environment-specific. A TML exported from one ThoughtSpot
+instance and imported into another will fail with an unresolvable GUID.
+
+**Applies to:** All source dialects.
+
+**Correct pattern:**
+```yaml
+table:
+  connection:
+    name: "Snowflake Production"   # display name from ts connections list
+```
+
+**Wrong (do NOT do this) — GUID in the connection block:**
+```yaml
+# connection block — fqn: here causes import failure on any other ThoughtSpot instance
+    name: "..."
+    fqn: "a1b2c3d4-..."   # WRONG — remove fqn:; use only name:
+```
+
+---
+
+### I7 — Consult the formula reference before declaring "untranslatable"
+
+**Rule:** Before classifying any expression as untranslatable, the skill must explicitly
+instruct the model to open the formula-translation reference for that source dialect and
+check the tables for **the direction it is converting in**. Do not decide from syntax alone.
+
+**Direction matters.** A `from-*` converter checks the source→ThoughtSpot (reverse) tables;
+a `to-*` converter checks the ThoughtSpot→target (forward) ones. Sending a converter to the
+wrong side is worse than no gate — it reads as diligence while proving nothing. Where a
+mapping is bidirectional (ts-snowflake, ts-databricks), the gate must name the side, and
+may name the other explicitly as the side *not* to consult.
+
+**Failure mode:** Expressions that appear Snowflake-specific or Databricks-specific have
+documented ThoughtSpot equivalents. Skipping the reference causes valid columns to be
+omitted from the converted model.
+
+**Applies to:** every `ts-convert-*` skill, in every runtime under `_dirs`. Each cites the
+mapping for its own dialect — resolved by name from the skill directory
+(`ts-convert-{from,to}-X` → `agents/shared/mappings/{X,ts-X}/*-formula-translation.md`), so
+a new dialect needs no edit here. Today: tableau, ts-snowflake, ts-databricks, looker,
+powerbi, qlik, sisense, ts-dbt.
+
+**Required gate — the marker is load-bearing.** `check_i7_gate.py` requires the literal
+string `MANDATORY (I7)` inside a blockquote that also cites this skill's dialect mapping
+and this file. Prose that states the rule without the marker is not enough: before
+2026-09-22 four skills instructed the model correctly in their own words and no gate could
+tell them apart from the five that said nothing.
+
+> **MANDATORY (I7) — before classifying any \<expression\> as untranslatable, open
+> [`<this skill's formula-translation mapping>`](<same path>)
+> and check \<the named sections, for this conversion direction\>. Do not decide from syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
+
+Name real section headings from the mapping file — a gate pointing at a section that does
+not exist sends the model nowhere. Worked example:
+`agents/cli/ts-convert-from-tableau/SKILL.md` (Step A3).
+
+---
+
+### I8 — No duplicate `column_id` values; second metric on same column must be a formula
+
+**Rule:** Every `column_id` value in `columns[]` must be unique. When a source defines
+multiple metrics on the same physical column with different aggregations (e.g.
+`SUM(SALARY)` and `AVG(SALARY)`), only ONE may use a `column_id`-based entry. All
+others must be expressed as `formulas[]` entries.
+
+**Failure mode:** ThoughtSpot rejects the TML import with:
+`"columns should have unique column_id values — duplicate {TABLE::COL}"`
+
+**Applies to:** All source dialects. Common in Snowflake SVs and Databricks MVs where
+multiple aggregations on the same column are a standard pattern.
+
+**Correct pattern — first metric as column, second as formula:**
+```yaml
+columns:
+- name: "Total Salary"
+  column_id: EMPLOYEES::SALARY
+  properties:
+    column_type: MEASURE
+    aggregation: SUM
+
+formulas:
+- id: formula_Avg Salary
+  name: "Avg Salary"
+  expr: "average ( [EMPLOYEES::SALARY] )"
+  properties:
+    column_type: MEASURE
+
+columns:
+- name: "Avg Salary"
+  formula_id: formula_Avg Salary
+  properties:
+    column_type: MEASURE
+```
+
+**Wrong (do NOT do this) — same column_id twice:**
+```yaml
+columns:
+- name: "Total Salary"
+  column_id: EMPLOYEES::SALARY       # first use — OK
+  properties:
+    column_type: MEASURE
+    aggregation: SUM
+- name: "Avg Salary"
+  column_id: EMPLOYEES::SALARY       # WRONG — duplicate column_id
+  properties:
+    column_type: MEASURE
+    aggregation: AVERAGE
+```
+
+**Which metric keeps the `column_id`?** Prefer keeping the SUM metric as the
+`column_id`-based entry (SUM is the most common default aggregation). Express AVG,
+MIN, MAX, COUNT, and other aggregations as formulas.
+
+---
+
+### I9 — Formula cross-references: inline the expression on first import
+
+**Rule:** A formula that references another formula column by bracket notation
+(`[Other Formula Name]`) will fail during TML import with "Search did not find
+'other formula name'". ThoughtSpot resolves formula references by display name at
+import time, but the referenced formula does not yet exist in the object when the
+referencing formula is validated.
+
+**Workaround:** Inline the referenced formula's expression directly into the
+referencing formula. For example, if formula B uses `[Total Sales]` which is defined
+as `group_aggregate(sum([TABLE::AMOUNT]), {[TABLE::REGION]}, {})`, expand formula B
+to contain the full `group_aggregate(...)` expression.
+
+**Alternative:** Import base formulas first (no cross-refs), export the model, then
+add dependent formulas via a second import using the exported JSON format.
+
+**Failure mode:** TML import returns "Search did not find '{formula_name}'" for every
+formula-to-formula bracket reference.
+
+**Applies to:** All source dialects — this is a ThoughtSpot platform constraint, not
+source-specific.
+
+---
+
+### I10 — Parameters: `CHAR` for string lists, `list_choice` as objects
+
+**Rule:** String-typed parameters with `list_config` must use `data_type: CHAR`.
+`VARCHAR` is accepted by the schema but rejected on import for list parameters.
+Each `list_choice` entry must be an object with `value:` (required) and `display_name:`
+(recommended) — bare string values are rejected.
+
+**Failure mode:** `data_type: VARCHAR` with `list_config` → "Invalid YAML/JSON syntax"
+on import. Bare `list_choice` values → same error.
+
+**Applies to:** All source dialects that generate parameters (Tableau parameters,
+future parameter support in SV/MV converters).
+
+**Correct pattern:**
+```yaml
+parameters:
+- name: Currency
+  data_type: CHAR
+  default_value: "USD"
+  list_config:
+    list_choice:
+    - value: USD
+      display_name: USD
+    - value: CAD
+      display_name: CAD
+```
+
+**Wrong (do NOT do this):**
+```yaml
+parameters:
+- name: Currency
+  data_type: VARCHAR              # WRONG — fails for list params
+  list_config:
+    list_choice:
+    - USD                          # WRONG — bare strings rejected
+    - CAD
+```
+
+---
+
+### I11 — Never set `is_hidden: true` during conversion
+
+**Rule:** Conversion skills must not set `is_hidden: true` on any column in the
+generated Model TML. All columns should be visible by default.
+
+**Failure mode:** Hidden columns cause locked visualizations — users cannot add the
+column to searches or answers, and existing visualizations that reference it become
+uneditable. Hidden columns also produce unexpected query behaviour when ThoughtSpot
+auto-selects join paths through them.
+
+**Applies to:** All source dialects (Tableau, Snowflake SV, Databricks MV, …).
+
+**Rationale:** Visibility is a post-import curation decision that belongs to the model
+owner, not the conversion skill. The source platform may mark columns as private or
+hidden (e.g. Snowflake SV `PRIVATE` visibility), but the ThoughtSpot model should not
+mirror that — the owner should decide what to hide after reviewing the imported model.
+
+---
+
+### I12 — `column_id` must always be `TABLE::col`-qualified, never bare
+
+**Rule:** Every physical-column `columns[]` entry's `column_id` must be `TABLE_NAME::col`
+— even on a single-table model. A bare `column_id` (e.g. `REGION`, with no `TABLE::`
+prefix) is rejected at import; it is not merely a style preference.
+
+**Failure mode:** Live-verified (2026-07, se-thoughtspot, `APJ_TAB` connection,
+`--policy VALIDATE_ONLY`): `column_id: REGION` on a single-table model fails with
+`"Unable to create model column(s). These column_id/formula_id values are incorrect:
+REGION"` (error_code 14547). The equivalent `column_id: AMAZON_SALES_DATA::REGION`
+validates clean. `ts tml lint` does not catch a bare `column_id` on its own (see I8,
+which only checks *duplicates*) — see `tml_lint.py`'s dedicated bare-`column_id` check
+for single-table models, which does.
+
+**Applies to:** All source dialects. Most likely to surface wherever a converter's
+table-attribution step is conditioned on `len(tables) == 1` (a common shortcut for
+"this datasource has one physical table") — any column that reaches TML assembly
+without that condition having stamped its owning table produces a bare `column_id`.
+
+**Correct:**
+```yaml
+columns:
+- name: "Region"
+  column_id: AMAZON_SALES_DATA::REGION   # TABLE::col — even for the model's only table
+  properties:
+    column_type: ATTRIBUTE
+```
+
+**Wrong (do NOT do this):**
+```yaml
+columns:
+- name: "Region"
+  column_id: REGION       # WRONG — bare column_id, rejected at import
+  properties:
+    column_type: ATTRIBUTE
+```
+
+---
+
+### I13 — Every `[formula_*]` reference must match a declared `formulas[].id`
+
+**Rule:** Every bracket reference of the form `[formula_X]` — in a `formulas[].expr` or
+as a `columns[].formula_id` — must match an `id` declared in the same document's
+`formulas[]`. I9 mandates the id *form*; this invariant says the id you used has to
+exist.
+
+**Failure mode:** Live-verified 2026-07-30 (se-thoughtspot, `--policy VALIDATE_ONLY`):
+a Model whose `formula_Avg Tenure` expression read `average ( [formula_tenure_months] )`
+while the declared id was `formula_Tenure Months` fails with
+
+```
+error_code 14516
+Formula addition failed. Formula: Avg Tenure, Error: Search did not find
+"formula_tenure_months )" in your data or metadata. Expecting one of the valid
+keywords, such as, "(", "-", "abs" etc..
+```
+
+So the outcome is a **hard import rejection**, not a silently-broken measure. The
+platform treats an unresolvable bracket reference as search tokens, which is why the
+error text quotes the token stream rather than the id.
+
+**Applies to:** All source dialects. The class is generic — any converter that mints a
+formula id in one code path and emits references to it from another can diverge. The
+from-Snowflake converter did exactly that between 2026-07-22 and 2026-07-30 (BL-178):
+the resolver emitted `[formula_<sql_token>]` while the builder declared
+`id: formula_<display title>`, so **every** metric reference dangled and every gate —
+`ts tml lint`, `check_tml.py`, and `build-model`'s own `lint_findings` — reported clean.
+The structural fix is to have one function own the naming, and have anything that must
+*predict* a minted id call it (`sv_translate.display_title` /
+`construct_formula_id`).
+
+**Gated by:** `ts tml lint` (`tml_lint._check_dangling_formula_refs`) and
+`tools/validate/check_tml.py`, both purely structural over a single document — no live
+instance and no judgment required.
+
+**Correct:**
+```yaml
+formulas:
+- id: formula_Tenure Months
+  name: Tenure Months
+  expr: "diff_months ( today ( ) , [EMPLOYEES::HIRE_DATE] )"
+- id: formula_Avg Tenure
+  name: Avg Tenure
+  expr: "average ( [formula_Tenure Months] )"   # matches the declared id exactly
+```
+
+**Wrong (do NOT do this):**
+```yaml
+formulas:
+- id: formula_Tenure Months
+  name: Tenure Months
+  expr: "diff_months ( today ( ) , [EMPLOYEES::HIRE_DATE] )"
+- id: formula_Avg Tenure
+  name: Avg Tenure
+  expr: "average ( [formula_tenure_months] )"   # WRONG — no such id; import fails
+```
+
+---
+
+### I14 — No ordered table pair may be joined more than once
+
+**Rule:** Within one Model, a given `(from_node, joins[].with)` pair may appear at most
+once. A dimension reached by several different keys — a date dimension joined on order
+date *and* ship date, or one employee table joined through five customer-team roles — is
+**role-played**, and each role needs its own aliased `model_tables` entry.
+
+**Failure mode:** two joins between the same pair leave the join path ambiguous and the
+Model will not load. Nothing upstream catches it: `build-model` assembled 21 such joins
+across 7 pairs on a real customer Semantic View, and I1–I13 all reported clean.
+
+**Why converters hit this by construction:** a Snowflake Semantic View scopes construct
+names *per table*, so declaring eight relationships from one fact to one `DIM_TIME` is
+legal and idiomatic there. ThoughtSpot has one flat join graph, so the same declaration
+is fatal. A source SV that models role-play *without* aliases therefore cannot be
+converted 1:1 — the aliases must be synthesized.
+
+**Correct shape** — one entry per role, `name` the physical table, `alias` the per-role
+node id. Joins carry the alias in `with:`; the `on` clause uses **physical** names on
+both sides; `column_id` prefixes use the **alias**:
+
+```yaml
+model_tables:
+- name: FACT_SALES
+  fqn: "{fact_guid}"
+  joins:
+  - name: FACT_SALES_TO_DIM_TIME_TRANSACTION
+    with: DIM_TIME                       # base node — the default date context
+    'on': "[FACT_SALES::TRANSACTION_DATE_ID] = [DIM_TIME::DATE_ID]"
+    type: LEFT_OUTER
+    cardinality: MANY_TO_ONE
+  - name: FACT_SALES_TO_DIM_TIME_SHIP
+    with: DIM_TIME_SHIP_DATE             # alias node
+    'on': "[FACT_SALES::SHIP_DATE_ID] = [DIM_TIME::DATE_ID]"
+    type: LEFT_OUTER
+    cardinality: MANY_TO_ONE
+- name: DIM_TIME
+  fqn: "{dim_guid}"
+- name: DIM_TIME                          # same physical table, second role
+  alias: DIM_TIME_SHIP_DATE
+  fqn: "{dim_guid}"
+columns:
+- name: "Fiscal Year"                     # base node: unqualified = default context
+  column_id: DIM_TIME::YEAR
+- name: "Fiscal Year (Ship Date)"         # alias node: suffix for uniqueness
+  column_id: DIM_TIME_SHIP_DATE::YEAR
+```
+
+**Keep one role on the base node.** Aliasing *every* role leaves the base table with no
+joins — a disconnected node in the model. Give the primary/default role the base entry
+(and its full column set); alias the rest.
+
+**Trim the alias column sets.** An alias does not need the whole dimension. A 56-column
+date dimension aliased 14 times adds 784 near-duplicate columns and degrades NL search
+more than the ambiguity it fixed; ~12 grouping columns per alias (calendar date, fiscal
+year/quarter/month/week names and orders, month/week ids) covers what users pivot on.
+Keep period flags and offsets (`is_ytd`, `same_date_id_last_year`) on the base node only.
+Set the join key to `index_type: DONT_INDEX` on every alias.
+
+**Applies to:** all convert-from skills (Tableau, Snowflake SV, Databricks MV).
+
+---
+
+### I15 — A column-root key must never appear inside `columns[].properties`
+
+**Rule:** Within a `columns[]` entry, `description`, `name`, `column_id` and `formula_id`
+are **siblings of `name`** at the entry root. Only the catalogued `properties.*` keys
+belong under `properties:` — `column_type`, `aggregation`, `synonyms`/`synonym_type`,
+`index_type`, `currency_type`, `ai_context` and the rest of that table in
+`thoughtspot-model-tml.md`.
+
+**Failure mode:** a Model import **silently ignores unknown keys inside `properties:`**.
+A misplaced key therefore validates clean, imports with `status_code OK`, and the value is
+simply gone. Nothing in the response distinguishes it from a successful import.
+
+**Why converters hit this by construction:** `synonyms` genuinely does belong under
+`properties:`, and it is populated two lines away from `description` in the same
+`_column_props()`-shaped helper every converter has. Putting both in the same dict reads
+as consistent and is wrong for exactly one of them.
+
+**Evidence (BL-232, 2026-09-02).** `description` was emitted under `properties` by
+**five** sites — `mv_build_model.py`, `sv_build_model.py` (writers), `mv_emit_classify.py`,
+`sv_build_sv.py` (readers) and `ts-from-snowflake-rules.md` (a mapping doc that the CoCo
+Snowsight runtime, which had no `ts` CLI, executed as its implementation; that runtime
+retired on 2026-11-08). Converting a real Metric View sent 19 of 19 descriptions and stored
+0; relocating them and re-importing the same GUID restored all 19. Synonyms survived both
+runs, which is what isolated the cause.
+
+Two properties of this bug are why it became an invariant rather than five fixes:
+
+- **Every gate was green** — `ts tml lint`, `build-model`'s own `invariant_findings`,
+  `VALIDATE_ONLY`, and the whole pre-commit suite, on a tree losing data.
+  `check_converter_parity` asserts helper adoption, `check_coverage_matrix` asserts row
+  existence rather than row *truth*, and `check_mapping_code_sync` gates emitted function
+  names — none of those three can see TML nesting. But the sharper point is that a
+  **placement gate already existed and was single-key**: `check_tml.py` flags
+  `column_type` at the column root (lines 162 and 366, for Table and Model TML
+  respectively) and has no handling of `description` at all. The lesson is not "no
+  validator could see this" — it is that the validator which *could* have was written
+  for one key and never generalised.
+- **The writer and reader bugs cancelled.** A TS→MV→TS round-trip through this repo's own
+  tools wrote to the wrong place and read from the same wrong place, so it round-tripped
+  perfectly while both halves were wrong against real ThoughtSpot. Fixing one side alone
+  turns the other into an active regression — which is what happened to `sv_build_sv.py`
+  mid-fix, caught only by an adversarial review of the fix itself.
+
+**Searching for it:** grep by indentation does not work — the five sites sat at two
+different indents, and a six-space pattern missed the four-space one. Parse the YAML and
+compare each `columns[]` entry's keys against the field table **in both directions**:
+inspecting `columns[].properties` alone is blind to the mirror error (a properties-only
+key hoisted to the root), and blind to misplacement in Table TML.
+
+**Enforced by:** `ts tml lint` (`_check_misplaced_column_root_keys`), over the root-only
+set `description` / `name` / `column_id` / `formula_id` / `data_panel_column_groups`.
+Deliberately a denylist of misplaced root keys, **not** an allow-list of valid
+`properties` keys: the linter gates imports, so an allow-list would fail a legitimate
+round-tripped Model carrying any property not yet catalogued.
+
+**Enforcement gaps, stated rather than implied.** The rule as written is symmetric — the
+schema references say a top-level `synonyms:` is silently dropped too — but the check is
+**one-directional** and does not flag a properties-only key hoisted to the root. It also
+runs on **Model TML only**: `lint_tml` returns early for a `table:` document, so a
+misplaced `description` in Table TML is unenforced even though
+`thoughtspot-table-tml.md` puts it at the column root as well. Both are tracked as
+BL-238; neither is a reason to weaken the rule.
+
+**Applies to:** the rule applies to every convert-from skill (Tableau, Snowflake SV,
+Databricks MV, Power BI, Qlik, Sisense) and both convert-to legs. *Enforcement* today
+covers Model TML in one direction only, per the gaps above.
+
+---
+
+### I16 — A Model `AGGREGATE` column must sit on a Table column that is `AGGREGATE` too
+
+**Rule:** when a Model column is `MEASURE` / `aggregation: AGGREGATE` — a semantic-layer
+measure (Databricks Metric View, Snowflake Semantic View) passed through to the platform's
+own measure function — the Table column under it must be `MEASURE` / `AGGREGATE` as well
+(and, by I23, carry `is_pre_aggregated_measure: true`).
+
+**Failure mode:** the two query paths read different levels. **UI search** reads the
+Model's aggregation and works. **AgentQL / SpotQL** reads the **Table's**: with the Table at
+`SUM`, an `AGG()` query is refused at generation (`QUERY_GEN_ERROR`) and a `SUM()` query is
+sent as plain `SUM(col)`, which the platform rejects (Databricks
+`METRIC_VIEW_MISSING_MEASURE_FUNCTION`). The Model imports clean and searches correctly, so
+nothing looks wrong until an agent queries it.
+
+**Evidence (2026-10-07, DBX Org on `nebula-ts-semview`).** Two hand-built Models over Metric
+Views — one over a composed MV, one joining six MVs and two tables in ThoughtSpot — had
+every MV measure `SUM` at the Table level and `AGGREGATE` on the Model. UI search on both
+returned the right totals; every AgentQL aggregate failed, in both forms above. A third
+Model, built by `ts link build`, carried `AGGREGATE` at both levels and worked. Setting the
+seven MV Tables' measures (exactly the columns Databricks flags `is_measure`) to
+`AGGREGATE` fixed both; a 60-case AgentQL corpus then matched the native star-schema Model
+on every comparable case.
+
+**Not flagged, deliberately:** the reverse (Table `AGGREGATE`, Model `ATTRIBUTE` or another
+aggregation) — the same day a Model ATTRIBUTE over an `AGGREGATE` Table column searched
+correctly, so there is no observed failure to gate on; and a Model column with no explicit
+`aggregation` (it may be inheriting).
+
+**Enforced by:** `ts tml lint` (`lint_model_table_aggregation`) when the Table TMLs are linted
+in the same batch as the Model (`--dir`, or `--file table.tml --file model.tml`). A Model
+linted alone is not checked — there is no Table to compare against. `ts link build` writes
+`AGGREGATE` at both levels, so its output satisfies this by construction; the rule exists
+for hand-built and hand-edited Models.
+
+**Applies to:** every Model over a semantic-layer object (`ts-link-semantic-layer`, and any
+hand-built equivalent).
+
+---
+
+### I17 — One join route between any two tables: no cycles, no second paths
+
+**Rule:** read the Model's joins as a **directed** graph, each alias its own node, with every
+arrow running from a join's MANY side to its ONE side. `cardinality` sets the direction, not
+placement: a `MANY_TO_ONE` or `ONE_TO_ONE` join (or one with no cardinality) points from its
+`model_tables[]` entry to `with:`, and a `ONE_TO_MANY` join points from `with:` back to the
+entry — so a 1:M declared under a dimension is the same arrow as an M:1 declared under the
+fact. The graph must contain no cycle that follows the arrows, and no two different
+arrow-following routes from one table to another.
+
+**Failure mode:** the import is rejected, and the message names nothing:
+
+| Shape | Server response |
+|---|---|
+| A → B and B → A (both `MANY_TO_ONE`), or A → B → C → A | error **13123**, "Schema validation failed" |
+| A → B → D and A → C → D (two routes to D) | error **13124**, "Schema validation failed" |
+| M:1 under A to B, plus 1:M under B to A — the same arrow twice | error **13124** |
+| the shared-dimension Model below with one leg flipped to `ONE_TO_MANY` | error **13124** — the flip makes a second route |
+
+**Direction is what matters.** Two fact tables sharing dimensions —
+`ORDERS → DATE`, `INVENTORY → DATE`, `ORDER_LINES → PRODUCT`, `INVENTORY → PRODUCT` — form a
+loop only when the arrows are ignored. That is the ordinary multi-fact shape and imports
+fine — as it does with the same legs written as 1:M joins under the dimensions — so I17 never
+flags it. A check that ignores direction flags every multi-fact Model; one that takes
+direction from placement instead of cardinality both flags valid Models and misses rejected
+ones.
+
+**Fix:** alias the table the second route reaches, once per role (the I14 pattern):
+`ORDERS → SHIPPER` (an alias of `SUPPLIER`) beside `PRODUCT → SUPPLIER` imports clean. I14 is
+the degenerate case of this rule — two joins between one pair — and keeps its own id.
+
+**Evidence:** live probes on se-thoughtspot 2026-10-21 — throwaway Models over existing tables,
+every shape under `--policy VALIDATE_ONLY`, the rejected ones also under `ALL_OR_NONE` with the
+same result; nothing persisted. The cardinality rows came from an independent review's probes,
+which also showed `MANY_TO_MANY` is rejected outright (14528 — not checked by lint; BL-397).
+
+**Enforced by:** `ts tml lint` — it names the cycle, or both routes from their lowest shared
+starting table, which the server's response never does.
+
+---
+
+### I18 — No self-joins
+
+**Rule:** no join may connect a physical table to itself, whether directly (`EMPLOYEE →
+EMPLOYEE`), to an alias of itself (`EMPLOYEE → MANAGER`), or between two aliases of it
+(`SALES_REP → REP_MANAGER`, both `DM_EMPLOYEE`).
+
+**Failure mode:** rejected in every form probed (2026-10-21): direct gives error 14565
+"INTERNAL ERROR"; through aliases gives 13125 "Schema validation failed" with physical names
+in `on:`, and "Invalid srcTable or destTable in join expression" with alias names.
+
+**Fix:** a parent-child hierarchy (employee → manager) is flattened in the warehouse — a view
+carrying the parent's columns — and that view joined as an ordinary dimension.
+
+**Enforced by:** `ts tml lint`.
+
+---
+
+### I19 — A join's `on:` names only its two tables, by physical name
+
+**Rule:** every `[TABLE::COL]` in a join's `on:` must name the physical table (`name:`) of the
+join's source entry or of its `with:` target. Never a third table, and never an alias — an
+alias is selected by `with:`, and `on:` always uses the physical name (as in I14's example).
+The two sides may appear in either order.
+
+**Failure mode:** "Invalid srcTable or destTable in join expression" at import, for a third
+table and for an alias name alike — including an ordinary, non-self join to an alias
+(live-probed 2026-10-21).
+
+**Enforced by:** `ts tml lint`. Joins carrying no inline `on:` (a `referencing_join` to a
+Table TML join) are not checked by this rule.
+
+---
+
+
+### I20 — No `MANY_TO_MANY` Model join
+
+**Rule:** a Model join's `cardinality` is `MANY_TO_ONE`, `ONE_TO_MANY` or `ONE_TO_ONE` —
+never `MANY_TO_MANY`.
+
+**Failure mode:** rejected at import, error **14528**: "Invalid value MANY_TO_MANY of field
+…joins…cardinality. Allowed values are MANY_TO_ONE, ONE_TO_MANY, ONE_TO_ONE" (live-probed
+2026-10-21). Emitting it as `MANY_TO_ONE` instead is worse: a many-to-many key fans out and
+totals inflate with no error.
+
+**Fix:** model the relationship through a bridge table in the warehouse, joined
+`MANY_TO_ONE` from each side. A converter that meets a many-to-many source relationship
+leaves the join out and flags it NEEDS REVIEW (Power BI and Sisense do). A Table TML's
+`joins_with` lists `MANY_TO_MANY` in its own vocabulary; that was not probed, so only Model
+joins are checked.
+
+**Enforced by:** `ts tml lint`.
+
+---
+
+### I21 — A `referencing_join` lives under the entry whose Table TML declares it
+
+**Rule:** a Model join written as `referencing_join: <name>` sits under the
+`model_tables[]` entry whose **own** Table TML has a `joins_with[]` entry of that name.
+
+**Failure mode:** placed under the other table — or naming a join that table does not
+have — it is rejected at import, error **14504** "Relationships do not exist", naming the
+`<table>::<join>` it looked for (live-probed 2026-10-21: the same join imports under its
+declaring table and fails under its destination).
+
+**Enforced by:** `ts tml lint`, cross-file like I16 — only when the entry's Table TML is
+linted in the same batch (`--dir`, or `--file table.tml --file model.tml`). A Model linted
+alone has no ground truth for what its Tables declare, so nothing automated checks I21
+there. The lint covers both halves of the rule: a misspelled name and a correct name under
+the wrong entry are each a join that entry's Table TML does not declare. (Until
+2026-11-08 the retired CoCo runtime's pre-import checklist also checked the name.)
+
+
+### I22 — An RLS rule's joins do not close a cycle with the Model's joins
+
+**Rule:** take the Model's join graph (I17: arrows MANY -> ONE) and add each join an RLS
+rule on one of its Tables actually uses — a join on a `rls_rules.table_paths[].join_path`
+that a rule's `expr` references — pointing away from the secured table. The result must
+have no directed cycle.
+
+**Failure mode:** the Model imports (I17 sees only its own joins), then queries fail
+with "Guid Mismatch" (BACH 12325): query generation sees one table with two roots — the
+Model's root, and itself via the RLS path. Seen on a support case: the Model joined
+`bridge -> users` MANY_TO_ONE and the rule on `users` joined out to `bridge`; Liveboard
+filtering broke for every user under the rule. Two joins with opposite cardinalities
+between one pair once RLS applies are the same shape (a two-table cycle).
+
+**Fix:** drop one of the two joins, or point the Model at a copy of the table without
+the RLS rule (or move the rule).
+
+**Enforced by:** `ts tml lint`, cross-file like I21 — only when the secured Table's TML
+is linted in the same batch; and `ts audit` S11. Graph mechanics: `ts_cli/tml_rls_graph.py`.
+A second route (diamond) through an RLS join is not checked: nothing shows it failing.
+
+### I23 — An `AGGREGATE` Table column carries `is_pre_aggregated_measure: true`
+
+**Rule:** a Table column at `MEASURE` / `aggregation: AGGREGATE` (a Semantic View or Metric
+View measure passed to the platform's own measure function) must carry
+`properties.is_pre_aggregated_measure: true`. Table only; the Model column needs nothing.
+
+**Failure mode (newer builds):** the Table and the Model import cleanly. AgentQL plans the
+column as an ATTRIBUTE and refuses `AGG()` on it with `COLUMNS_NOT_GROUPED_OR_AGGREGATED`.
+Not recorded before the fix: whether UI search worked, and a Model column that inherits the
+aggregation rather than stating it; both are expected (search reads the Model, I16; AgentQL
+reads the Table).
+
+**Evidence (2026-11-12, semantic SQL DEV cluster).** A Table built by `ts link build` over a
+Databricks Metric View failed this way; a Table over another Metric View on the same
+connection, which carried the flag, answered the same query. Adding the flag to the six
+measures (GUID kept) fixed it: AgentQL with one or two dimensions or none, and UI search, all
+matched Databricks. The October build (I16's evidence) did not need it. Snowflake Semantic
+Views are untested; a released build accepts the key on import: `ts-link-semantic-layer` open
+items #9 and #10.
+
+**Enforced by:** `ts tml lint` (`_check_pre_aggregated_flag`) on every Table TML, linted alone
+or in a batch. Only the YAML boolean `true` counts. `ts link build` writes it (ts-cli 0.214.0).
+
+**Applies to:** every Table over a semantic-layer object (`ts-link-semantic-layer`, and any
+hand-built equivalent).
+
+---
+
+## Naming
+
+### N1 — Model name: bare source name, no prefix
+
+**Rule:** The converted model's `name:` must use the bare source object name (view name,
+workbook + datasource name, etc.). Do not prepend environment markers such as `TEST_`,
+`TEST_SV_`, `TEST_MV_`, or similar prefixes.
+
+**Rationale:** Production migrations must not carry test markers. If the user needs a
+prefix for local testing, they can override the name interactively — every skill should
+ask the user if they want a different name before importing.
+
+**Applies to:** All source dialects. Supersedes any prior per-skill default that used
+`TEST_SV_*` or `TEST_MV_*` prefixes.
+
+**Correct:**
+```yaml
+model:
+  name: "DUNDER_MIFFLIN_SALES"     # bare view/datasource name
+```
+
+**Wrong (do NOT do this):**
+```yaml
+model:
+  name: "TEST_SV_DUNDER_MIFFLIN_SALES"   # WRONG — environment marker in production TML
+```
+
+---
+
+## Pass-through translation policy
+
+### PT1 — Scalar pass-through is reliable; aggregate pass-through must be flagged for review
+When a source function has no native ThoughtSpot equivalent but the underlying warehouse
+provides an equivalent SQL function, translate it via a ThoughtSpot pass-through op
+(`sql_*_op`) rather than dropping it.
+
+- **Scalar pass-throughs** (`sql_string_op`, `sql_int_op`, `sql_double_op`, `sql_bool_op`,
+  `sql_date_op`, `sql_time_op`, `sql_date_time_op`) are row-level and reliable — use freely.
+- **Aggregate pass-throughs** (`sql_*_aggregate_op`) DO work but interact with ThoughtSpot's
+  query-time aggregation/grouping context, so correctness is not guaranteed. ALWAYS mark any
+  aggregate pass-through with a "⚑ flag for review" note and surface it in the conversion output.
+
+**Applies to:** all convert-from skills (Tableau, Snowflake SV, Databricks MV).
+
+---
+
+### PT2 — Six string functions have no native ThoughtSpot form; renaming to the same name is rejected at import
+
+**Rule:** `UPPER`, `LOWER`, `TRIM`, `LTRIM`, `RTRIM` and `REPLACE` do **not** exist as
+ThoughtSpot formula functions. A converter must emit a `sql_string_op` pass-through, never
+a same-named rename. Live-disproved on se-thoughtspot: `upper`/`lower` 2026-06-13,
+the other four 2026-07-29/30 (BL-170 / BL-171). The authoritative list — including any
+function later added or removed — is the strikethrough rows in
+`agents/shared/schemas/thoughtspot-formula-patterns.md`; read it rather than trusting this
+paragraph's enumeration.
+
+**Failure mode:** the formula is **rejected at import with `error_code 14516`** — but the
+conversion report says `Migrated`, because a name-for-name rename looks like a successful
+translation to every check that only asks "is this a plausible function?".
+
+**Applies to:** every converter that translates source string functions.
+
+**Correct pattern:**
+```
+UPPER(`Region`)   ->  sql_string_op ( "UPPER({0})" , [Region] )
+TRIM(`Name`)      ->  sql_string_op ( "TRIM({0})" , [Name] )
+```
+
+**Wrong (do NOT do this):**
+```
+UPPER(`Region`)   ->  upper([Region])     # WRONG — `upper` does not exist; rejected at import
+TRIM(`Name`)      ->  trim([Name])        # WRONG — same
+```
+
+Use `formula_common.wrap_passthrough_calls` with a `PASSTHROUGH_MAP`, rather than a new
+per-platform implementation — see the cross-converter drift section of the
+`conversion-consistency-auditor` agent, and BL-217.
+
+**Why this is an invariant and not just a mapping row.** `check_formula_catalog` already
+guards the function names, but only in markdown **table rows** — a mapping doc that writes
+its function map as prose bullets bypasses it silently. That is exactly how a converter
+shipped all six of these as `Migrated` (PR #440). The invariant exists so the audit catches
+the class even when the validator's parser cannot see it.
+
+---
+
+## Intentional differences (do NOT harmonize)
+
+### EXC1 — Cumulative/moving: model formula vs answer-level
+
+`cumulative_*` and `moving_*` functions **are valid as model formulas** when the first
+argument is an **unaggregated column reference** — verified 2026-06-13 on se-thoughtspot
+(GUID `889a704f-2714-4649-9cea-23551cb68d64`, model `TEST_SV_DMSI_AI_CONTEXT`):
+
+```
+cumulative_sum ( [DM_ORDER_DETAIL::QUANTITY] , [DM_ORDER::ORDER_DATE] )
+```
+
+The constraint is on the **first argument's aggregation state**, not on the source dialect:
+
+| First arg form | Model formula? | Why |
+|---|---|---|
+| Unaggregated column ref: `[table::col]` | **YES** — valid in `formulas[]` | ThoughtSpot applies its own aggregation at query time |
+| `group_aggregate()` wrapped: `group_aggregate(max([col]), query_groups(), query_filters())` | **YES** — valid in `formulas[]` | `group_aggregate` encapsulates the aggregation so the outer function sees a single value, not an aggregate expression |
+| Aggregated expression: `sum([table::col])` | **NO** — rejected with *"expects 1st argument to be not aggregated"* | Already-aggregated args conflict with the query engine's own aggregation; use `group_aggregate()` wrapper instead |
+| Measure display name: `[Sales]` | **Answer-level only** — valid in `search_query`, not in model `formulas[]` | Display-name refs resolve in the live query context, not at model definition time |
+
+**Implications per source:**
+
+| Source | Treatment | Reason |
+|---|---|---|
+| Snowflake SV / Databricks MV window functions | Translate to model formulas with unaggregated `[table::col]` refs | Source column refs are unaggregated — maps directly |
+| Tableau `RUNNING_SUM(SUM([col]))` / `WINDOW_AVG(SUM([col]))` | **Model formula is valid** if converted to unaggregated form: `cumulative_sum ( [table::col] , [sort_col] )`. Fall back to answer-level if the sort dimension cannot be determined from the workbook | The Tableau `SUM()` wrapper must be stripped — the unaggregated column ref goes to the model formula |
+| Tableau positional table calcs (`INDEX`, `LOOKUP`, `FIRST`, `LAST`, `SIZE`, `PREVIOUS_VALUE`) | Answer-level only or untranslatable — do **NOT** emit as model formulas | These are row-position-dependent; no ThoughtSpot model-level equivalent |
+| `RANK`, `PERCENTILE` | Answer-level: use `rank()` in `search_query` | See Running / Cumulative Functions section in formula-translation.md |

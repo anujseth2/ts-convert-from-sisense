@@ -1,0 +1,930 @@
+"""ts tml — export and import ThoughtSpot Markup Language objects."""
+from __future__ import annotations
+
+import fnmatch
+import json
+import re
+import select
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+import typer
+import yaml
+
+from ts_cli.client import ThoughtSpotClient, resolve_profile
+
+app = typer.Typer(help="TML export and import commands.")
+
+_profile_option = typer.Option(None, "--profile", "-p", envvar="TS_PROFILE",
+                               help="Profile name (default: first profile or TS_PROFILE env var)")
+
+_file_option = typer.Option(
+    [], "--file",
+    help=(
+        "Path to a raw TML file to read (repeatable: --file a.tml --file b.tml). "
+        "Reads the file's raw text directly — no JSON-array wrapper needed. "
+        "Mutually exclusive with piped stdin content."
+    ),
+)
+_dir_option = typer.Option(
+    None, "--dir",
+    help=(
+        "Read every .tml/.yaml/.yml/.json file in this directory (non-recursive), "
+        "in sorted-name order, after any --file entries. "
+        "Mutually exclusive with piped stdin content."
+    ),
+)
+
+# Non-printable characters that cause YAML parse errors in ThoughtSpot edoc output.
+# Keeps: tab (09), LF (0A), CR (0D), printable ASCII (20-7E), NEL (85),
+# non-breaking space (A0), and BMP chars up to FFFD.
+_NONPRINTABLE_RE = re.compile(r'[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uFFFD]')
+
+# Top-level keys that identify TML object types in a parsed edoc.
+_TML_TYPE_KEYS = frozenset({
+    "model", "table", "answer", "liveboard", "worksheet",
+    "view", "pinboard", "sql_view",
+})
+
+
+def strip_nonprintable(text: str) -> str:
+    """Remove non-printable characters from a TML edoc string before parsing."""
+    return _NONPRINTABLE_RE.sub("", text)
+
+
+# Extensions considered by --dir when scanning for TML files (case-insensitive).
+_TML_DIR_EXTENSIONS = (".tml", ".yaml", ".yml", ".json")
+
+
+def collect_tml_paths(
+    files: List[str],
+    directory: Optional[str],
+    patterns: Optional[List[str]] = None,
+) -> List[str]:
+    """Resolve --file / --dir CLI options into an ordered list of file paths.
+
+    --file entries are used verbatim, in the order given. A --dir entry is expanded
+    to every file directly inside that directory (non-recursive) whose extension is
+    one of _TML_DIR_EXTENSIONS, sorted by name for determinism, and appended after
+    the explicit --file entries.
+
+    `patterns`, when given, is a list of fnmatch glob patterns (e.g. "*.liveboard.tml")
+    that further restricts the --dir matches to filenames matching at least one
+    pattern. Default `None` preserves the original behaviour (no filtering) —
+    existing callers are unaffected.
+
+    Only touches the filesystem to list directory contents — never reads file
+    bodies (that's read_tml_texts). Raises SystemExit with a clear message on a
+    missing/invalid --dir, or when --dir matches no files.
+    """
+    paths: List[str] = list(files)
+    if directory:
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            raise SystemExit(f"--dir path does not exist or is not a directory: {directory}")
+        matched = sorted(
+            p for p in dir_path.iterdir()
+            if p.is_file() and p.suffix.lower() in _TML_DIR_EXTENSIONS
+            and (patterns is None or any(fnmatch.fnmatch(p.name, pat) for pat in patterns))
+        )
+        if not matched:
+            raise SystemExit(
+                f"--dir matched no .tml/.yaml/.yml/.json files: {directory}"
+            )
+        paths.extend(str(p) for p in matched)
+    return paths
+
+
+# Tableau-import TML type ordering: table -> sql_view -> model -> cohort -> liveboard.
+# Matched by filename suffix (case-insensitive); anything unrecognised sorts last.
+_TYPE_SUFFIX_RANK = (
+    (".table.tml", 0), (".sql_view.tml", 1), (".model.tml", 2),
+    (".cohort.tml", 3), (".liveboard.tml", 4),
+)
+
+# Matches phased model filenames like "x.phase1.model.tml". Group 1 is the phase
+# number; phase 0 (or no phase suffix at all) counts as the "base" model.
+_PHASE_RE = re.compile(r"\.phase(\d+)\.model\.tml$", re.IGNORECASE)
+
+
+def _tml_type_rank(path: str) -> int:
+    """Return the tableau-order sort rank for a TML path based on its filename suffix.
+
+    Unrecognised suffixes (not table/sql_view/model/cohort/liveboard) rank last (5).
+    """
+    low = path.lower()
+    for suffix, rank in _TYPE_SUFFIX_RANK:
+        if low.endswith(suffix):
+            return rank
+    return 5
+
+
+def _is_base_model(path: str) -> bool:
+    """True if `path` is a base model TML: no `.phaseN.model.tml` suffix, or phase 0.
+
+    `x.model.tml` and `x.phase0.model.tml` are both base models. `x.phase1.model.tml`,
+    `x.phase2.model.tml`, etc. are not.
+    """
+    m = _PHASE_RE.search(path)
+    return m is None or m.group(1) == "0"
+
+
+def order_and_filter_tml_paths(
+    paths: List[str],
+    order: str = "name",
+    model_phase: str = "all",
+) -> List[str]:
+    """Reorder and/or filter an already-resolved list of TML paths.
+
+    `order="tableau"` sorts by TML type (table -> sql_view -> model -> cohort ->
+    liveboard, via _tml_type_rank), then by path name for determinism within a type.
+    `order="name"` (default) leaves the input order untouched.
+
+    `model_phase="base"` drops phased model files `*.phaseN.model.tml` for N >= 1,
+    keeping bare `*.model.tml` and `*.phase0.model.tml` (see _is_base_model).
+    `model_phase="all"` (default) leaves every path in place.
+
+    Both parameters default to no-ops — calling with no arguments beyond `paths`
+    returns `paths` unchanged (as a new list). Pure function: no filesystem access.
+    """
+    result = list(paths)
+    if model_phase == "base":
+        result = [
+            p for p in result
+            if not (p.lower().endswith(".model.tml") and not _is_base_model(p))
+        ]
+    if order == "tableau":
+        result = sorted(result, key=lambda p: (_tml_type_rank(p), p))
+    return result
+
+
+def read_tml_texts(paths: List[str]) -> List[str]:
+    """Read raw TML text from each path, in order. Raises SystemExit on a missing file."""
+    texts: List[str] = []
+    for raw in paths:
+        p = Path(raw)
+        if not p.is_file():
+            raise SystemExit(f"--file path does not exist or is not a file: {raw}")
+        texts.append(p.read_text())
+    return texts
+
+
+def _stdin_has_piped_content() -> bool:
+    """True if stdin was redirected (piped or from a file) AND actually carries content.
+
+    Consumes stdin when it returns True — callers only invoke this on the --file/--dir
+    path, where the original JSON-array stdin read never happens, so nothing is lost.
+    Skips reading entirely when stdin is a TTY (interactive terminal, nothing piped) so
+    an interactive invocation of --file/--dir never blocks waiting on input.
+
+    An open non-TTY stdin that carries no data (e.g. a background/script shell whose
+    stdin is an idle pipe) must NOT trigger a blocking read — a bare `sys.stdin.read()`
+    there hangs forever waiting on an EOF that never comes (BL-097). We therefore only
+    read once `select` reports the fd readable within a zero timeout: data ready reads
+    as content; EOF (a closed pipe or `< /dev/null`) reads as empty; a regular-file
+    redirect always reports readable. An idle open pipe reports not-readable and we
+    return False without reading. On platforms/handles where `select` can't poll stdin
+    (e.g. a Windows non-socket handle) we fall back to the prior blocking read rather
+    than risk misclassifying genuine piped input.
+    """
+    if sys.stdin.isatty():
+        return False
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        return bool(sys.stdin.read().strip())
+    if not ready:
+        return False
+    return bool(sys.stdin.read().strip())
+
+
+def load_input_tmls(
+    files: List[str],
+    directory: Optional[str],
+    patterns: Optional[List[str]] = None,
+    order: str = "name",
+    model_phase: str = "all",
+) -> List[str]:
+    """Resolve the TML input source for `ts tml import` / `ts tml lint`.
+
+    --file/--dir take precedence when given: paths are resolved via
+    `collect_tml_paths` (applying `patterns` to --dir matches), then reordered/
+    filtered via `order_and_filter_tml_paths` (`order`, `model_phase`), then read.
+    Otherwise, falls back to the original interface: a JSON array of TML strings
+    (or a single JSON string) read from stdin — unchanged from prior versions.
+    `patterns`/`order`/`model_phase` have no effect on the stdin path.
+
+    Combining --file/--dir with piped stdin content is rejected as ambiguous: pick
+    one input mode.
+    """
+    using_file_args = bool(files) or bool(directory)
+    if using_file_args:
+        if _stdin_has_piped_content():
+            raise SystemExit(
+                "Ambiguous input: both --file/--dir and piped stdin content were given.\n"
+                "Use exactly one input mode — stdin (JSON array of TML strings) or "
+                "--file/--dir (raw TML file paths) — not both."
+            )
+        paths = collect_tml_paths(files, directory, patterns=patterns)
+        paths = order_and_filter_tml_paths(paths, order=order, model_phase=model_phase)
+        return read_tml_texts(paths)
+
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid JSON on stdin: {e}")
+
+    if isinstance(payload, str):
+        return [payload]
+    elif isinstance(payload, list):
+        return payload
+    else:
+        raise SystemExit("stdin must be a JSON string or array of TML strings.")
+
+
+def detect_tml_type(parsed: Optional[dict]) -> Optional[str]:
+    """Return the TML object type from the top-level key (excluding 'guid'/'obj_id').
+
+    ThoughtSpot TML has exactly one top-level key that names the object type
+    (e.g. 'model', 'table', 'answer'). The optional 'guid' and 'obj_id' keys
+    at document root are excluded from the search.
+
+    Returns 'unknown' if `parsed` is a dict with no recognised type key.
+
+    Returns `None` (distinct from 'unknown') when `parsed is None` -- which is what
+    `parse_edoc` returns for a null/empty edoc (`yaml.safe_load("")` is `None`), the
+    shape a FORBIDDEN or OBJECT_INVALID_STATE export item comes back with (BL-189).
+    Without this guard, `key in parsed` below raises
+    `TypeError: argument of type 'NoneType' is not iterable` -- an unhandled crash
+    that aborted a whole export batch over one inaccessible object.
+    """
+    if parsed is None:
+        return None
+    _skip = {"guid", "obj_id"}
+    # Prefer known type keys first for determinism
+    for key in _TML_TYPE_KEYS:
+        if key in parsed:
+            return key
+    # Fallback: first non-metadata key
+    for key in parsed:
+        if key not in _skip:
+            return key
+    return "unknown"
+
+
+def parse_edoc(edoc: str, format: str = "YAML") -> dict:
+    """Parse a TML edoc string into a Python dict.
+
+    Strips non-printable characters before parsing. Supports YAML (default)
+    and JSON formats matching the --format flag on ts tml export.
+
+    Raises:
+        yaml.YAMLError: if YAML parsing fails.
+        json.JSONDecodeError: if JSON parsing fails.
+    """
+    cleaned = strip_nonprintable(edoc)
+    if format.upper() == "JSON":
+        return json.loads(cleaned)
+    return yaml.safe_load(cleaned)
+
+
+@app.command("export")
+def export_tml(
+    guids: List[str] = typer.Argument(..., help="One or more GUIDs to export"),
+    profile: Optional[str] = _profile_option,
+    fqn: bool = typer.Option(False, "--fqn", help="Include fully-qualified names in output"),
+    associated: bool = typer.Option(False, "--associated",
+                                    help="Export associated objects (e.g. tables for a model)"),
+    format: str = typer.Option("YAML", "--format", "-f",
+                               help="Output format: YAML or JSON"),
+    parse: bool = typer.Option(False, "--parse",
+                               help=(
+                                   "Parse each edoc string into a structured JSON object. "
+                                   "Output changes from [{edoc: '...', info: {...}}] to "
+                                   "[{type: '...', guid: '...', tml: {...}, info: {...}}]. "
+                                   "Handles non-printable character stripping automatically."
+                               )),
+    type: Optional[str] = typer.Option(None, "--type",
+                                       help="Metadata type to include in each export entry. "
+                                            "Omit for standard TML export."),
+    include_obj_id: bool = typer.Option(False, "--include-obj-id",
+                                        help="Include obj_id on the exported object itself."),
+    include_obj_id_ref: bool = typer.Option(False, "--include-obj-id-ref",
+                                            help="Include obj_id on referenced objects "
+                                                 "(e.g. model_tables entries)."),
+    include_guid: bool = typer.Option(True, "--include-guid/--no-guid",
+                                      help="Include guid at document root. "
+                                           "Default: true. Use --no-guid to omit."),
+    split_dir: Optional[str] = typer.Option(
+        None, "--split-dir",
+        help="Write each parsed item to its own JSON file in this directory "
+             "(model.json / table_<NAME>.json / <type>_<guid>.json) instead of "
+             "passing the whole array through stdout. Implies --parse."),
+) -> None:
+    """Export TML for one or more objects.
+
+    Output: JSON from POST /api/rest/2.0/metadata/tml/export.
+    The response contains an array of objects with 'edoc' (the TML string)
+    and metadata about each exported object.
+
+    With --parse, each edoc is parsed from YAML (or JSON) into a structured
+    object. Non-printable characters are stripped automatically. This
+    eliminates the boilerplate parse loop that every skill otherwise needs.
+
+    With --split-dir, each parsed item is written to its own file in that
+    directory rather than returned as one array — the shape `ts dbt-export
+    build`/`diff`/`sync` read with --model and --tables-dir. Naming is
+    `model.json` for the Model, `table_<TABLE NAME>.json` per Table, and
+    `<type>_<guid>.json` for anything else. stdout becomes a small manifest of
+    what was written, so a 40-table export no longer passes through the caller's
+    context purely to be re-emitted as files.
+
+    With --parse, an item with no edoc content (a FORBIDDEN or OBJECT_INVALID_STATE
+    object -- no view access, or a broken object) is skipped rather than aborting
+    the batch: a warning naming the object and the reason (if the response carries
+    one) is printed to stderr, and the item is omitted from the JSON array on
+    stdout. Exit code is 1 if any item was skipped, 0 otherwise -- stdout always
+    carries the successfully parsed items regardless of exit code.
+
+    Note: --type FEEDBACK is not supported. Feedback (nls_feedback) TML must
+    be exported via the feedback object's own GUID, not the parent model's
+    GUID. To locate feedback GUIDs: use `ts metadata dependents <model-guid>`
+    and look for FEEDBACK type objects in the response.
+
+    Examples:
+
+    \b
+      ts tml export abc-123
+      ts tml export abc-123 --fqn --associated
+      ts tml export abc-123 --fqn --associated --parse
+      ts tml export abc-123 def-456 --format JSON
+      ts tml export abc-123 --include-obj-id --include-obj-id-ref --no-guid --parse
+      ts tml export abc-123 --associated --split-dir ./export
+    """
+    if type and type.upper() == "FEEDBACK":
+        raise SystemExit(
+            "Error: --type FEEDBACK is not supported.\n"
+            "\n"
+            "Feedback TML must be exported via the feedback object's own GUID,\n"
+            "not the parent model's GUID. The ThoughtSpot API returns 400 when\n"
+            "a model GUID is passed with type=FEEDBACK.\n"
+            "\n"
+            "To find feedback objects for a model:\n"
+            "  ts metadata dependents <model-guid> --profile <profile>\n"
+            "Look for 'FEEDBACK' type entries, then export their GUIDs directly."
+        )
+
+    client = ThoughtSpotClient(resolve_profile(profile))
+
+    def _entry(g: str) -> dict:
+        entry: dict = {"identifier": g}
+        if type:
+            entry["type"] = type
+        return entry
+
+    body: dict = {
+        "metadata": [_entry(g) for g in guids],
+        "export_fqn": fqn,
+        "export_associated": associated,
+        "formattype": format,
+    }
+    export_opts: dict = {}
+    if include_obj_id:
+        export_opts["include_obj_id"] = True
+    if include_obj_id_ref:
+        export_opts["include_obj_id_ref"] = True
+    if not include_guid:
+        export_opts["include_guid"] = False
+    if export_opts:
+        body["export_options"] = export_opts
+
+    resp = client.post("/api/rest/2.0/metadata/tml/export", json=body)
+    data = resp.json()
+
+    if not parse and not split_dir:
+        print(json.dumps(data))
+        return
+
+    result = []
+    skipped = 0
+    for item in data:
+        parsed_item = _parse_export_item(item, format)
+        if parsed_item is None:
+            skipped += 1
+            continue
+        result.append(parsed_item)
+
+    if split_dir:
+        written = _write_split_dir(result, Path(split_dir))
+        print(json.dumps({"split_dir": str(Path(split_dir)), "written": written}, indent=2))
+        typer.echo(f"  {len(written)} file(s) written to {split_dir}", err=True)
+        if skipped:
+            raise SystemExit(1)
+        return
+
+    # JSON to stdout regardless -- skills pipe it, and the ts-cli convention is
+    # structured data on stdout with diagnostics on stderr (see `tml import`'s
+    # import_failures handling above). The exit code is what changes.
+    print(json.dumps(result))
+    if skipped:
+        raise SystemExit(1)
+
+
+def _split_file_name(item: dict, used: set) -> str:
+    """Filename for one parsed export item, unique within `used`.
+
+    `model.json` / `table_<NAME>.json` is the layout `ts dbt-export` reads with
+    `--model` and `--tables-dir`; anything else falls back to
+    `<type>_<guid>.json`. A duplicate name (two Tables with the same name in
+    different schemas, which an Org happily holds) gets its guid appended
+    rather than overwriting the first — a silent overwrite here would drop a
+    table from the generated dbt project with no diagnostic anywhere.
+    """
+    tml = item.get("tml") or {}
+    kind = item.get("type") or "object"
+    if kind == "model":
+        base = "model"
+    elif kind == "table":
+        base = f"table_{(tml.get('table') or {}).get('name') or item.get('guid', 'unnamed')}"
+    else:
+        base = f"{kind}_{item.get('guid', 'unnamed')}"
+
+    base = "".join(c if c.isalnum() or c in "._- " else "_" for c in base)
+    name = f"{base}.json"
+    if name in used:
+        name = f"{base}_{item.get('guid', len(used))}.json"
+    used.add(name)
+    return name
+
+
+def _write_split_dir(items: List[dict], out: Path) -> List[str]:
+    """Write each parsed item to its own JSON file; return the relative names."""
+    out.mkdir(parents=True, exist_ok=True)
+    used: set = set()
+    written: List[str] = []
+    for item in items:
+        name = _split_file_name(item, used)
+        (out / name).write_text(json.dumps(item.get("tml") or {}, indent=2),
+                                encoding="utf-8")
+        written.append(name)
+    return written
+
+
+def _parse_export_item(item: dict, format: str) -> Optional[dict]:
+    """Parse one `tml export --parse` response item into `{type, guid, tml, info}`.
+
+    Returns `None` (after printing a stderr warning) when the item's `edoc` is
+    falsy -- an empty string or an explicit `null` -- rather than attempting to
+    parse it. That is exactly what a FORBIDDEN (no view access) or
+    OBJECT_INVALID_STATE (broken object) export item returns, and feeding it to
+    `parse_edoc`/`detect_tml_type` unguarded used to crash the whole batch with an
+    unhandled `TypeError` over one inaccessible GUID (BL-189). The reason is read
+    from `info.status` when the response carries one -- the same
+    `info.status.status_code` shape `publish_planning.py` already reads for this
+    endpoint -- so the caller learns which GUID was dropped and why, on stderr,
+    without the drop showing up in the JSON on stdout.
+    """
+    edoc = item.get("edoc")
+    info = item.get("info") or {}
+    obj_name = info.get("name", "unknown")
+    if not edoc:
+        guid = info.get("id") or "unknown"
+        status = info.get("status") or {}
+        reason = (
+            status.get("error_message")
+            or status.get("status_code")
+            or "no edoc returned (object inaccessible or invalid)"
+        )
+        print(f"Warning: skipping '{obj_name}' ({guid}): {reason}", file=sys.stderr)
+        return None
+    try:
+        parsed_tml = parse_edoc(edoc, format)
+    except Exception as exc:
+        raise SystemExit(
+            f"--parse: failed to parse edoc for '{obj_name}': {exc}"
+        ) from exc
+    return {
+        "type": detect_tml_type(parsed_tml),
+        "guid": parsed_tml.get("guid", ""),
+        "tml": parsed_tml,
+        "info": info,
+    }
+
+
+@app.command("import")
+def import_tml(
+    profile: Optional[str] = _profile_option,
+    policy: str = typer.Option(
+        "PARTIAL", "--policy",
+        help="Import policy: PARTIAL (best-effort) or ALL_OR_NONE (atomic).",
+    ),
+    create_new: bool = typer.Option(
+        False, "--create-new/--no-create-new",
+        help=(
+            "Allow creating new objects. Default: --no-create-new (update existing only). "
+            "Use --create-new only when importing a brand-new object with no existing GUID. "
+            "Warning: --create-new with a TML that contains an existing GUID will silently "
+            "create a duplicate with a new GUID instead of updating the original."
+        ),
+    ),
+    file: List[str] = _file_option,
+    directory: Optional[str] = _dir_option,
+    order: str = typer.Option(
+        "name", "--order",
+        help="File order: name (default) or tableau (table→sql_view→model→cohort→liveboard)",
+    ),
+    model_phase: str = typer.Option(
+        "all", "--model-phase",
+        help="all (default) or base (drop *.phaseN.model.tml for N>=1)",
+    ),
+    pattern: List[str] = typer.Option(
+        [], "--pattern",
+        help="Glob(s) to filter --dir files, e.g. --pattern '*.liveboard.tml'",
+    ),
+) -> None:
+    """Import TML objects.
+
+    Two input modes (mutually exclusive):
+
+    \b
+    1. --file/--dir: reads raw TML text directly from one or more files.
+       --file is repeatable; --dir imports every .tml/.yaml/.yml/.json file
+       in a directory (non-recursive). --order/--model-phase/--pattern only
+       apply to this mode.
+    2. stdin (default when neither --file nor --dir is given): a JSON array
+       of TML strings (or a single JSON string).
+
+    Use PARTIAL policy for tables (tolerates partial failures) and
+    ALL_OR_NONE for models (either the whole model works or nothing is created).
+
+    Default is --no-create-new (update existing objects only). Use --create-new
+    only when importing brand-new TML that has no existing GUID — passing
+    --create-new with a TML containing an existing GUID creates a duplicate.
+
+    Output: JSON from POST /api/rest/2.0/metadata/tml/import containing
+    per-object status and GUIDs of created/updated objects.
+
+    Examples:
+
+    \b
+      # Update an existing model from a file (default behaviour)
+      ts tml import --file model.tml --policy ALL_OR_NONE
+
+      # Import every TML file in a directory
+      ts tml import --dir ./tml_out --policy PARTIAL
+
+      # Create a brand-new object from a file with no GUID
+      ts tml import --file model.tml --policy ALL_OR_NONE --create-new
+
+      # Tableau-order directory import, base model only, then filtered by pattern
+      ts tml import --dir ./tml_out --order tableau --model-phase base --policy ALL_OR_NONE
+      ts tml import --dir ./tml_out --pattern '*.liveboard.tml' --policy PARTIAL --create-new
+
+      # Original stdin interface (unchanged)
+      python3 -c "import json,pathlib; print(json.dumps([pathlib.Path('model.tml').read_text()]))" \\
+        | ts tml import --policy ALL_OR_NONE
+    """
+    tmls = load_input_tmls(file, directory, patterns=(pattern or None), order=order, model_phase=model_phase)
+
+    client = ThoughtSpotClient(resolve_profile(profile))
+    resp = client.post(
+        "/api/rest/2.0/metadata/tml/import",
+        json={
+            "metadata_tmls": tmls,
+            "import_policy": policy,
+            "create_new": create_new,
+        },
+    )
+    data = resp.json()
+
+    # `metadata/tml/import` returns HTTP 200 even when items failed -- the per-item outcome
+    # lives in the body, not the status code -- so `resp.ok` alone reports success on an
+    # import that did nothing (BL-138). Collected BEFORE the GUID back-fill below, which
+    # deliberately skips non-OK items and would otherwise be the only thing that noticed.
+    from ts_cli.tml_common import (
+        IMPORTED_STATUS_CODES, format_import_failures, format_import_warnings,
+        tml_import_failures, tml_import_warnings,
+    )
+
+    import_failures = tml_import_failures(data)
+    import_warnings = tml_import_warnings(data)
+
+    # ThoughtSpot often returns an empty object list despite a successful import.
+    # For each OK response with no GUID, search by name and back-fill the GUID.
+    from ts_cli.tml_common import extract_imported_guid
+
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        response_block = item.get("response", {})
+        status = response_block.get("status", {})
+        if status.get("status_code") not in IMPORTED_STATUS_CODES:
+            continue
+        obj_list = response_block.get("object", [])
+        if extract_imported_guid([item]):
+            continue  # GUID already present (nested or flat shape)
+        # Try to recover the GUID from the TML name field
+        idx = item.get("request_index", 0)
+        if idx < len(tmls):
+            m = re.search(r"^\s*name:\s*(.+)$", tmls[idx], re.MULTILINE)
+            if m:
+                obj_name = m.group(1).strip().strip("\"'")
+                search_resp = client.post(
+                    "/api/rest/2.0/metadata/search",
+                    json={
+                        "metadata": [{"type": "LOGICAL_TABLE", "name_pattern": obj_name}],
+                        # -1: a substring `name_pattern` page can omit the exact match,
+                        # losing the imported object's GUID (audit finding 14.5).
+                        "record_size": -1,
+                        "record_offset": 0,
+                        "include_headers": True,
+                    },
+                )
+                results = search_resp.json()
+                if isinstance(results, list):
+                    for r in results:
+                        if r.get("metadata_name") == obj_name:
+                            # Back-fill into the response structure
+                            if not obj_list:
+                                response_block["object"] = [{"header": {}}]
+                            response_block["object"][0].setdefault("header", {})["id_guid"] = r["metadata_id"]
+                            break
+
+    # JSON to stdout even on failure -- skills pipe it, and the ts-cli convention is
+    # structured data on stdout with diagnostics on stderr. The exit code is what changes.
+    print(json.dumps(data))
+    # WARNING items DID import (live-verified 2026-09-09): say so on stderr, exit 0.
+    if import_warnings:
+        for line in format_import_warnings(import_warnings, "Imported TML"):
+            print(line, file=sys.stderr)
+    if import_failures:
+        for line in format_import_failures(import_failures, "Could not import TML"):
+            print(line, file=sys.stderr)
+        raise SystemExit(1)
+
+
+def _parse_tml_docs(tmls: List[str]) -> tuple[list, dict[int, str]]:
+    """Pass 1 — parse every doc up front (tracking per-index YAML errors without
+    aborting the batch) so the generated-tables map can see every table/sql_view
+    TML in the batch before any model is linted.
+    """
+    parsed: list = []
+    parse_errors: dict[int, str] = {}
+    for i, edoc in enumerate(tmls):
+        try:
+            parsed.append(parse_edoc(edoc))
+        except yaml.YAMLError as e:
+            parsed.append(None)
+            parse_errors[i] = f"YAML parse error: {e}"
+    return parsed, parse_errors
+
+
+def _table_column_names(table: dict) -> set:
+    """Column names contributed by one parsed table TML doc.
+
+    A model's physical column_id is TABLE::db_column_name (see
+    model_builder._build_model_columns), but a display alias may differ from
+    db_column_name — index BOTH so a renamed column doesn't trip a false XREF finding.
+    """
+    col_names: set = set()
+    for c in table.get("columns") or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("name"):
+            col_names.add(c["name"])
+        if c.get("db_column_name"):
+            col_names.add(c["db_column_name"])
+    return col_names
+
+
+def _sql_view_column_names(sql_view: dict) -> set:
+    """Column names contributed by one parsed sql_view TML doc."""
+    return {
+        c.get("name") for c in (sql_view.get("sql_view_columns") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+
+
+def _build_generated_tables_map(parsed: list) -> dict[str, set]:
+    """Generated table/sql_view name -> column-name set, built from this batch only."""
+    tables: dict[str, set] = {}
+    for data in parsed:
+        if not isinstance(data, dict):
+            continue
+        table = data.get("table")
+        sql_view = data.get("sql_view")
+        if isinstance(table, dict) and table.get("name"):
+            tables[table["name"]] = _table_column_names(table)
+        elif isinstance(sql_view, dict) and sql_view.get("name"):
+            tables[sql_view["name"]] = _sql_view_column_names(sql_view)
+    return tables
+
+
+def _build_table_aggregations_map(parsed: list) -> dict[str, dict]:
+    """Table name -> per-column (column_type, aggregation), for the I16 check."""
+    from ts_cli.tml_lint import table_aggregations
+    return {d["table"]["name"]: table_aggregations(d["table"]) for d in parsed
+            if isinstance(d, dict) and isinstance(d.get("table"), dict) and d["table"].get("name")}
+
+
+def _build_table_joins_index(parsed: list) -> dict:
+    """(table lower, join name) -> on:, from this batch's Table TMLs (JOIN-KEY rule)."""
+    from ts_cli.tml_join_graph import table_join_index
+    return table_join_index({d["table"]["name"]: d["table"] for d in parsed
+                             if isinstance(d, dict) and isinstance(d.get("table"), dict)
+                             and d["table"].get("name")})
+
+
+def _lint_one_doc(i: int, data, parse_errors: dict[int, str], tables: dict[str, set],
+                  table_aggs: Optional[dict] = None, table_bodies: Optional[dict] = None) -> dict:
+    """Lint pass 2 — lint one already-parsed doc (lint_tml + optional cross-reference
+    check against the batch's generated-tables map). Returns the result entry
+    ``{index, type, name, findings}``.
+    """
+    from ts_cli.tml_lint import (
+        lint_cross_references, lint_model_table_aggregation, lint_referencing_joins,
+        lint_rls_join_cycles, lint_tml, table_join_names,
+    )
+
+    if i in parse_errors:
+        return {"index": i, "type": "?", "name": None, "findings": [parse_errors[i]]}
+    findings = lint_tml(data) if isinstance(data, dict) else ["TML is not a mapping"]
+    if tables and isinstance(data, dict) and isinstance(data.get("model"), dict):
+        findings = findings + lint_cross_references(data, tables)
+        findings = findings + lint_model_table_aggregation(data, table_aggs or {})
+        findings = findings + lint_referencing_joins(data, table_join_names(table_bodies or {}))
+        rls_notes: list = []
+        findings = findings + lint_rls_join_cycles(data, table_bodies or {}, notes=rls_notes)
+        for note in rls_notes:  # a path I22 could not walk: diagnostics, never a finding
+            print(f"I22 note: {note}", file=sys.stderr)
+    inner = data.get("model") or data.get("table") or {} if isinstance(data, dict) else {}
+    return {
+        "index": i,
+        "type": detect_tml_type(data) if isinstance(data, dict) else "?",
+        "name": inner.get("name") if isinstance(inner, dict) else None,
+        "findings": findings,
+    }
+
+
+@app.command("lint")
+def lint_tml_cmd(
+    file: List[str] = _file_option,
+    directory: Optional[str] = _dir_option,
+    order: str = typer.Option(
+        "name", "--order",
+        help="File order: name (default) or tableau (table→sql_view→model→cohort→liveboard)",
+    ),
+    model_phase: str = typer.Option(
+        "all", "--model-phase",
+        help="all (default) or base (drop *.phaseN.model.tml for N>=1)",
+    ),
+    pattern: List[str] = typer.Option(
+        [], "--pattern",
+        help="Glob(s) to filter --dir files, e.g. --pattern '*.liveboard.tml'",
+    ),
+    require_join_key: List[str] = typer.Option(
+        [], "--require-join-key",
+        help="Opt-in: every Model join must equate this column on both tables "
+             "(repeatable), e.g. a tenant key in a shared-schema warehouse",
+    ),
+    exempt: List[str] = typer.Option(
+        [], "--exempt",
+        help="With --require-join-key: skip joins touching this table, physical or "
+             "alias name (repeatable) — shared reference tables with no tenant key",
+    ),
+) -> None:
+    """Lint TML for the model invariants VALIDATE_ONLY does not catch, plus guid placement.
+
+    Reads the SAME input as `ts tml import` — either --file/--dir (raw TML file paths,
+    with --order/--model-phase/--pattern applying only to this mode) or, when neither is
+    given, a JSON array of TML strings (or a single string) from stdin. No ThoughtSpot
+    connection needed; pure local structural check. Run it before import to fail loud on
+    issues the server accepts silently.
+
+    When the input batch includes at least one table/sql_view TML alongside a model TML
+    (e.g. linting a whole `ts tableau build-model` output directory via --dir), each model
+    is ADDITIONALLY checked for dangling cross-references (XREF findings) against the
+    table/sql_view TMLs generated in the same batch — a model_tables/column_id/join
+    reference to a table or column that was never generated — and for a Model column
+    marked AGGREGATE whose Table column is not (I16: AgentQL reads the Table's). Linting a single model file
+    on its own (the common case) skips this check — there is no ground truth for what
+    tables already exist in ThoughtSpot from a model file alone.
+
+    --require-join-key is an opt-in convention, not an invariant (ThoughtSpot imports
+    such a Model): every join must carry `[A::KEY] = [B::KEY]`, so rows from different
+    tenants in one schema can never match. Its findings are prefixed JOIN-KEY:. A join
+    that only references a Table TML join is checked against that Table TML when it is
+    in the same batch.
+
+    Output: JSON {"clean": bool, "results": [{index, type, name, findings: [...]}]}.
+    Exit code 1 if any document has findings, else 0.
+
+    \b
+      ts tml lint --file model.tml
+      ts tml lint --dir ./tml_out
+      ts tml lint --dir ./tml_out --order tableau --model-phase base
+      ts tml lint --file table.tml --file model.tml   # also runs the XREF cross-ref check
+      ts tml lint --dir ./tml --require-join-key customer_id --exempt CALENDAR
+      cat payload.json | ts tml lint
+    """
+    if exempt and not require_join_key:
+        typer.echo("--exempt only applies with --require-join-key.", err=True)
+        raise SystemExit(2)
+    tmls = load_input_tmls(file, directory, patterns=(pattern or None), order=order, model_phase=model_phase)
+
+    # Pass 1 — parse every doc up front, then build the generated-tables map
+    # from this batch's table/sql_view docs before linting any model.
+    parsed, parse_errors = _parse_tml_docs(tmls)
+    tables = _build_generated_tables_map(parsed)
+    table_aggs = _build_table_aggregations_map(parsed)
+    table_bodies = {d["table"]["name"]: d["table"] for d in parsed
+                    if isinstance(d, dict) and isinstance(d.get("table"), dict)
+                    and d["table"].get("name")}
+    table_joins = _build_table_joins_index(parsed) if require_join_key else {}
+
+    results = []
+    any_findings = False
+    for i in range(len(tmls)):
+        entry = _lint_one_doc(i, parsed[i], parse_errors, tables, table_aggs, table_bodies)
+        if require_join_key and entry["type"] == "model":
+            from ts_cli.tml_join_graph import lint_required_join_key
+            entry["findings"] += lint_required_join_key(
+                parsed[i], require_join_key, exempt, table_joins)
+        results.append(entry)
+        any_findings = any_findings or bool(entry["findings"])
+
+    print(json.dumps({"clean": not any_findings, "results": results}))
+    raise SystemExit(1 if any_findings else 0)
+
+
+def _liveboard_doc(client: ThoughtSpotClient, identifier: str) -> dict:
+    """Export a Liveboard's TML and return the parsed doc dict (``{}`` on any failure).
+
+    Used both to name tiles for per-tile render probing and to run the static
+    axis-encoding check. Best-effort — a parse failure just means no per-tile attribution
+    and no axis findings, never a crash."""
+    resp = client.post("/api/rest/2.0/metadata/tml/export",
+                        json={"metadata": [{"identifier": identifier}]}, raise_for_status=False)
+    try:
+        doc = yaml.safe_load(resp.json()[0]["edoc"])
+    except (ValueError, AttributeError, KeyError, TypeError, IndexError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+@app.command("verify-render")
+def verify_render_cmd(
+    liveboard: str = typer.Argument(..., help="GUID or name of the imported Liveboard to verify"),
+    profile: Optional[str] = _profile_option,
+    org: Optional[str] = typer.Option(None, "--org",
+                                       help="Org id/name the Liveboard lives in (default: profile/env org)"),
+) -> None:
+    """Verify an imported Liveboard actually RENDERS — not merely that it imported.
+
+    Two ways a board that imports cleanly still fails a user:
+    - A hand-authored or mis-bound answer fails at query time ("No data source found"); this
+      calls `metadata/liveboard/data` and, on failure, re-probes each tile to name it.
+    - A chart tile with no axis encoding *loads data* (the board returns 200) but draws
+      BLANK — the data check alone would pass it, so those tiles are flagged separately.
+
+    Output: JSON `{"ok", "board", "tiles_rendered", "error", "failing_tiles":[{visual,error}],
+    "blank_chart_tiles":[{visual,chart_type}]}`. Exit 0 only if the board returns data AND has
+    no blank chart tiles — so a skill's import step can gate on it.
+
+    \b
+      ts tml verify-render <liveboard-guid> --profile myprofile
+    """
+    from ts_cli.render_check import classify_render, render_summary, chart_tiles_missing_axis
+    client = ThoughtSpotClient(resolve_profile(profile), org=org)
+
+    def _data(body: dict) -> tuple:
+        r = client.post("/api/rest/2.0/metadata/liveboard/data", json=body,
+                        raise_for_status=False, timeout=180)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {"error": r.text[:300]}
+
+    # Export the board TML once: names tiles for per-tile probing AND feeds the axis check.
+    doc = _liveboard_doc(client, liveboard)
+    lb = doc.get("liveboard") or doc.get("pinboard") or {}
+    viz_names = [nm for v in lb.get("visualizations", [])
+                 if (nm := (v.get("answer", {}) or {}).get("name"))]
+    blank_tiles = chart_tiles_missing_axis(doc)
+
+    status, body = _data({"metadata_identifier": liveboard})
+    board = classify_render(status, body)
+
+    per_viz: Optional[list] = None
+    if not board["rendered"]:
+        # Re-probe each tile so we can name the culprit, not just report a board-level 500.
+        per_viz = []
+        for name in viz_names:
+            st, bd = _data({"metadata_identifier": liveboard, "visualization_identifiers": [name]})
+            entry = classify_render(st, bd)
+            entry["visual"] = name
+            per_viz.append(entry)
+
+    summary = render_summary(liveboard, board, per_viz, blank_tiles)
+    print(json.dumps(summary))
+    raise SystemExit(0 if summary["ok"] else 1)

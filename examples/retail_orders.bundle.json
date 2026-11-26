@@ -1,0 +1,392 @@
+{
+  "dashboard": {
+    "oid": "d1",
+    "title": "Retail Orders Overview",
+    "datasource": {
+      "title": "Retail Orders"
+    },
+    "filters": [
+      {
+        "instanceid": "F-STATUS",
+        "jaql": {
+          "dim": "[orders.status]",
+          "datatype": "text",
+          "title": "status",
+          "filter": {
+            "all": true
+          }
+        }
+      },
+      {
+        "instanceid": "F-REGION",
+        "jaql": {
+          "dim": "[customers.region]",
+          "datatype": "text",
+          "title": "region",
+          "filter": {
+            "all": true
+          }
+        }
+      }
+    ]
+  },
+  "widgets": [
+    {
+      "oid": "w1",
+      "type": "indicator",
+      "title": "",
+      "metadata": {
+        "ignore": {
+          "all": false,
+          "ids": [],
+          "dimensions": []
+        },
+        "panels": [
+          {
+            "name": "value",
+            "items": [
+              {
+                "jaql": {
+                  "title": "Total Orders",
+                  "formula": "count([K])",
+                  "context": {
+                    "[K]": {
+                      "dim": "[orders.order_id]",
+                      "datatype": "numeric"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "secondary",
+            "items": []
+          },
+          {
+            "name": "filters",
+            "items": []
+          }
+        ]
+      }
+    },
+    {
+      "oid": "w2",
+      "type": "indicator",
+      "title": "",
+      "metadata": {
+        "ignore": {
+          "all": false,
+          "ids": [],
+          "dimensions": []
+        },
+        "panels": [
+          {
+            "name": "value",
+            "items": [
+              {
+                "jaql": {
+                  "title": "Shipped Share",
+                  "formula": "(count([K]),[S])/count([K])",
+                  "context": {
+                    "[K]": {
+                      "dim": "[orders.order_id]",
+                      "datatype": "numeric"
+                    },
+                    "[S]": {
+                      "dim": "[orders.status]",
+                      "datatype": "text",
+                      "filter": {
+                        "members": [
+                          "SHIPPED"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "secondary",
+            "items": []
+          },
+          {
+            "name": "filters",
+            "items": []
+          }
+        ]
+      }
+    },
+    {
+      "oid": "w3",
+      "type": "indicator",
+      "title": "",
+      "metadata": {
+        "ignore": {
+          "all": false,
+          "ids": [
+            "F-REGION"
+          ],
+          "dimensions": []
+        },
+        "panels": [
+          {
+            "name": "value",
+            "items": [
+              {
+                "jaql": {
+                  "title": "Orders All Regions",
+                  "formula": "count([K])",
+                  "context": {
+                    "[K]": {
+                      "dim": "[orders.order_id]",
+                      "datatype": "numeric"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "secondary",
+            "items": []
+          },
+          {
+            "name": "filters",
+            "items": []
+          }
+        ]
+      }
+    },
+    {
+      "oid": "w4",
+      "type": "indicator",
+      "title": "",
+      "metadata": {
+        "ignore": {
+          "all": false,
+          "ids": [],
+          "dimensions": []
+        },
+        "panels": [
+          {
+            "name": "value",
+            "items": [
+              {
+                "jaql": {
+                  "title": "Open Orders",
+                  "formula": "count([K])",
+                  "context": {
+                    "[K]": {
+                      "dim": "[orders.order_id]",
+                      "datatype": "numeric"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "secondary",
+            "items": []
+          },
+          {
+            "name": "filters",
+            "items": [
+              {
+                "jaql": {
+                  "dim": "[orders.status]",
+                  "datatype": "text",
+                  "title": "status",
+                  "filter": {
+                    "members": [
+                      "OPEN"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "oid": "w5",
+      "type": "chart/bar",
+      "title": "Revenue by Region",
+      "metadata": {
+        "panels": [
+          {
+            "name": "categories",
+            "items": [
+              {
+                "jaql": {
+                  "dim": "[customers.region]",
+                  "datatype": "text",
+                  "title": "region"
+                }
+              }
+            ]
+          },
+          {
+            "name": "values",
+            "items": [
+              {
+                "jaql": {
+                  "dim": "[orders.amount]",
+                  "datatype": "numeric",
+                  "agg": "sum",
+                  "title": "Revenue"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "oid": "w6",
+      "type": "pivot2",
+      "title": "Orders by Customer and Status",
+      "metadata": {
+        "panels": [
+          {
+            "name": "rows",
+            "items": [
+              {
+                "jaql": {
+                  "dim": "[customers.customer_name]",
+                  "datatype": "text",
+                  "title": "customer_name"
+                }
+              }
+            ]
+          },
+          {
+            "name": "columns",
+            "items": [
+              {
+                "jaql": {
+                  "dim": "[orders.status]",
+                  "datatype": "text",
+                  "title": "status",
+                  "filter": {
+                    "members": [
+                      "OPEN",
+                      "SHIPPED"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "values",
+            "items": [
+              {
+                "jaql": {
+                  "title": "Orders",
+                  "formula": "count([K])",
+                  "context": {
+                    "[K]": {
+                      "dim": "[orders.order_id]",
+                      "datatype": "numeric"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "datamodel": {
+    "title": "Retail Orders",
+    "datasets": [
+      {
+        "schema": {
+          "tables": [
+            {
+              "oid": "t-orders",
+              "id": "orders",
+              "name": "orders",
+              "columns": [
+                {
+                  "oid": "c-oid",
+                  "id": "order_id",
+                  "name": "order_id",
+                  "type": 8
+                },
+                {
+                  "oid": "c-cid",
+                  "id": "customer_id",
+                  "name": "customer_id",
+                  "type": 8
+                },
+                {
+                  "oid": "c-st",
+                  "id": "status",
+                  "name": "status",
+                  "type": 18
+                },
+                {
+                  "oid": "c-amt",
+                  "id": "amount",
+                  "name": "amount",
+                  "type": 6
+                },
+                {
+                  "oid": "c-dt",
+                  "id": "order_date",
+                  "name": "order_date",
+                  "type": 4
+                }
+              ]
+            },
+            {
+              "oid": "t-cust",
+              "id": "customers",
+              "name": "customers",
+              "columns": [
+                {
+                  "oid": "c-cid2",
+                  "id": "customer_id",
+                  "name": "customer_id",
+                  "type": 8
+                },
+                {
+                  "oid": "c-cn",
+                  "id": "customer_name",
+                  "name": "customer_name",
+                  "type": 18
+                },
+                {
+                  "oid": "c-rg",
+                  "id": "region",
+                  "name": "region",
+                  "type": 18
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "relations": [
+      {
+        "columns": [
+          {
+            "table": "t-cust",
+            "column": "c-cid2"
+          },
+          {
+            "table": "t-orders",
+            "column": "c-cid"
+          }
+        ]
+      }
+    ]
+  }
+}

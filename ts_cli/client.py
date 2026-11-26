@@ -1,0 +1,506 @@
+"""ThoughtSpot HTTP client with profile-based auth and token caching."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import requests
+from urllib3.exceptions import NewConnectionError
+
+PROFILES_PATH = Path.home() / ".claude" / "thoughtspot-profiles.json"
+
+# The token-exchange endpoint itself must never trigger the 401-retry path below —
+# a 401 from auth/token/full is a credential failure, not a stale-cache symptom, and
+# _authenticate() already raises a clear SystemExit for that case. This constant only
+# matters if some future caller ever routes that endpoint through request() instead of
+# calling self._session.post() directly (as _authenticate() does today).
+_AUTH_TOKEN_PATH = "/api/rest/2.0/auth/token/full"
+
+# Transient gateway/network faults worth retrying with backoff (BL-089 1c).
+# A flaky instance returning 502/503/504 (or a dropped connection) otherwise
+# hard-fails every call — and a 504 HTML page reaching a caller's .json() gives
+# a raw JSONDecodeError traceback. 500 is deliberately excluded: it's an
+# application error, and retrying it would mask real failures.
+_RETRY_STATUSES = frozenset({502, 503, 504})
+_RETRY_MAX = 3          # retries after the initial attempt (4 attempts total)
+_RETRY_BACKOFF_S = 0.5  # base backoff, doubled each retry: 0.5s, 1s, 2s
+
+# Calls that create something: repeating one after the server already processed it
+# makes a second object. Observed 2026-09-29 — a read timeout on `tml import
+# --create-new` was retried and left four identical Tables. Updates, sets, shares,
+# deletes and parameterizations converge on the same state, so they stay retryable.
+_NON_IDEMPOTENT_PATH_RE = re.compile(r"(/create|/tml/import|/tml/async/import)$")
+
+
+def _is_idempotent(method: str, path: str) -> bool:
+    return method.upper() == "GET" or not _NON_IDEMPOTENT_PATH_RE.search(path.split("?")[0])
+
+
+def _never_sent(exc: Exception) -> bool:
+    """True only when the request provably never reached the server — a connect
+    timeout, or a connection that was never established. A read timeout or a
+    mid-response disconnect is ambiguous: the server may have done the work."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.exceptions.ConnectionError) or \
+            isinstance(exc, requests.exceptions.ChunkedEncodingError):
+        return False
+    reason = getattr(exc.args[0], "reason", None) if exc.args else None
+    return isinstance(reason, NewConnectionError)   # incl. NameResolutionError (urllib3 2)
+
+
+def _refuse_ambiguous_retry(
+    idempotent: bool, method: str, url: str, *,
+    exc: Optional[Exception] = None, status: Optional[int] = None,
+) -> None:
+    """Exit instead of retrying a create/import whose outcome is unknown. A no-op for an
+    idempotent call, a failure that provably never reached the server, or a status that
+    is not a retryable gateway fault."""
+    if idempotent or (exc is not None and _never_sent(exc)) or \
+            (status is not None and status not in _RETRY_STATUSES):
+        return
+    what = f"network error ({type(exc).__name__})" if exc is not None else str(status)
+    print(
+        f"ThoughtSpot API {what} on {method} {url} — not retried: this call changes "
+        "objects and the server may already have processed it. Check what it changed "
+        "before re-running.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def format_http_error(method: str, url: str, resp: "requests.Response") -> str:
+    """Build a single-line, secret-free diagnostic for a non-2xx response.
+
+    The ThoughtSpot error body (when JSON) carries `debug`/`error`/`message` fields that
+    pinpoint the failure far better than a Python traceback. We surface those and NEVER
+    echo request headers (which hold the bearer token).
+    """
+    detail = ""
+    body = (resp.text or "").strip()
+    if body:
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                detail = str(
+                    data.get("debug")
+                    or data.get("error")
+                    or data.get("message")
+                    or data.get("incident_id")
+                    or body
+                )
+            else:
+                detail = body
+        except ValueError:
+            detail = body
+    detail = " ".join(detail.split())  # collapse whitespace/newlines to one line
+    if len(detail) > 500:
+        detail = detail[:500] + "…"
+    suffix = f" — {detail}" if detail else ""
+    return f"ThoughtSpot API {resp.status_code} on {method} {url}{suffix}"
+
+
+def _slugify(name: str) -> str:
+    """Derive the profile slug used for Keychain service names.
+
+    Delegates to profile_ops.slugify — the single source of truth.
+    """
+    from ts_cli.profile_ops import slugify
+    return slugify(name)
+
+
+def resolve_profile(profile: Optional[str]) -> str:
+    """Return the profile name to use, with fallback to TS_PROFILE env var
+    and then the first profile in the profiles file.
+
+    File parsing is delegated to load_profiles() (audit finding 4.2) — it is
+    the single source of truth for the three documented profiles-file shapes
+    (wrapped, bare list, name-keyed dict). Do not re-parse the file here; a
+    hand-rolled `list(raw.values())[0]` fallback previously broke on the
+    wrapped `{"profiles": [...]}` shape (audit finding 4.1).
+    """
+    if profile:
+        return profile
+    env = os.environ.get("TS_PROFILE", "")
+    if env:
+        return env
+    if not PROFILES_PATH.exists():
+        raise SystemExit(
+            f"No profiles file found at {PROFILES_PATH}.\n"
+            "Run /ts-profile-thoughtspot to create a profile first."
+        )
+    profiles = load_profiles()
+    if not profiles:
+        raise SystemExit(
+            "No ThoughtSpot profiles configured.\n"
+            "Run /ts-profile-thoughtspot to add a profile."
+        )
+    return next(iter(profiles.values()))["name"]
+
+
+def load_profiles() -> Dict[str, Any]:
+    """Load all profiles as a name → profile dict.
+
+    Delegates to profile_ops.load_platform_profiles and converts to the
+    name-keyed dict that callers (ThoughtSpotClient, resolve_profile) expect.
+    """
+    from ts_cli.profile_ops import load_platform_profiles
+    profiles = load_platform_profiles("thoughtspot")
+    return {p["name"]: p for p in profiles}
+
+
+class ThoughtSpotClient:
+    """Authenticated HTTP client for the ThoughtSpot REST API.
+
+    Auth flow (matches ts-profile-thoughtspot/SKILL.md):
+      1. Check for a valid cached token in the OS temp directory.
+      2. If none, read the credential — first from the env var named in the
+         profile, then directly from the OS credential store via keyring as
+         fallback (macOS Keychain, Windows Credential Manager, Linux Secret
+         Service).
+      3. If token_env: use the credential as the bearer token directly.
+         If password_env / secret_key_env: exchange for a bearer token via
+         POST /api/rest/2.0/auth/token/full and cache the result.
+
+    Credentials are managed exclusively through /ts-profile-thoughtspot.
+    Do not set credential env vars manually — use that skill to add, update,
+    or refresh credentials, which stores them in the OS credential store.
+    """
+
+    def __init__(self, profile_name: str, *, org: Optional[str] = None):
+        profiles = load_profiles()
+        if profile_name not in profiles:
+            available = ", ".join(profiles.keys()) or "(none)"
+            raise SystemExit(
+                f"Profile '{profile_name}' not found.\n"
+                f"Available profiles: {available}\n"
+                "Run /ts-profile-thoughtspot to add a profile."
+            )
+        self._profile = profiles[profile_name]
+        self._profile_name = profile_name
+        self._slug = _slugify(profile_name)
+        # Optional org context, highest precedence first: an explicit `org` argument, then
+        # the TS_ORG env var, then the profile's `org_id`/`org`. It scopes the minted token
+        # to a non-default org, passed to auth/token/full (accepts an org id or name).
+        # Without it, calls run in the user's default org.
+        #
+        # The explicit argument exists because a per-Org operation (`ts share`, where groups
+        # are per-Org) needs several org-scoped clients alive in ONE process. Mutating
+        # TS_ORG between them would leak org context into every client built afterwards.
+        self._org = (org or os.environ.get("TS_ORG") or self._profile.get("org_id")
+                     or self._profile.get("org") or "")
+        self._base_url = self._profile["base_url"].rstrip("/")
+        self._verify_ssl: bool = self._profile.get("verify_ssl", True)
+        self._token: Optional[str] = None
+        self._session = requests.Session()
+        self._session.verify = self._verify_ssl
+
+    # ------------------------------------------------------------------
+    # Token caching
+    # ------------------------------------------------------------------
+
+    def _org_auth_fields(self) -> Dict[str, Any]:
+        """Org-scoping fields for auth/token/full. Verified: the API takes `org_id` (int) —
+        `org_identifier` is silently ignored. Falls back to a string identifier only for a
+        non-numeric org value."""
+        if not self._org:
+            return {}
+        try:
+            return {"org_id": int(self._org)}
+        except (ValueError, TypeError):
+            return {"org_identifier": str(self._org)}
+
+    def _cache_key(self) -> str:
+        # Org-aware so switching TS_ORG doesn't reuse a token minted for another org.
+        return f"{self._slug}_org{_slugify(str(self._org))}" if self._org else self._slug
+
+    def _token_path(self) -> Path:
+        return Path(tempfile.gettempdir()) / f"ts_token_{self._cache_key()}.txt"
+
+    def _expiry_path(self) -> Path:
+        return Path(tempfile.gettempdir()) / f"ts_token_{self._cache_key()}_expiry.txt"
+
+    def _read_cached_token(self) -> Optional[str]:
+        token_path = self._token_path()
+        expiry_path = self._expiry_path()
+        if not token_path.exists():
+            return None
+
+        if expiry_path.exists():
+            try:
+                expiry_ms = int(expiry_path.read_text().strip())
+                if time.time() * 1000 > expiry_ms - 60_000:
+                    return None  # expires within 60 s — refresh
+            except ValueError:
+                return None  # corrupt expiry file — force fresh auth
+        else:
+            # No expiry file: treat as stale after 23 hours
+            age = time.time() - token_path.stat().st_mtime
+            if age > 23 * 3600:
+                return None
+
+        return token_path.read_text().strip()
+
+    def _write_cached_token(self, token: str, expiry_ms: Optional[int]) -> None:
+        token_path = self._token_path()
+        expiry_path = self._expiry_path()
+        token_path.write_text(token)
+        token_path.chmod(0o600)
+        if expiry_ms:
+            expiry_path.write_text(str(expiry_ms))
+            expiry_path.chmod(0o600)
+
+    def clear_token_cache(self) -> bool:
+        """Remove cached token files. Returns True if anything was removed."""
+        removed = False
+        for p in (self._token_path(), self._expiry_path()):
+            if p.exists():
+                p.unlink()
+                removed = True
+        return removed
+
+    # ------------------------------------------------------------------
+    # Credential resolution
+    # ------------------------------------------------------------------
+
+    def _get_credential(self, env_var: str) -> str:
+        """Read a credential — env var first, OS credential store fallback.
+
+        The OS credential store fallback uses the `keyring` library, which
+        delegates to macOS Keychain, Windows Credential Manager, or Linux
+        Secret Service depending on the platform.
+        """
+        val = os.environ.get(env_var, "")
+        if val:
+            return val
+
+        # OS credential store fallback — service name matches ts-profile-thoughtspot derivation
+        service = f"thoughtspot-{self._slug}"
+        username = self._profile.get("username", "")
+        try:
+            import keyring  # deferred import — graceful if not installed
+            stored = keyring.get_password(service, username)
+            if stored:
+                return stored
+        except Exception:
+            pass
+
+        raise SystemExit(
+            f"No credential found for profile '{self._profile_name}'.\n"
+            "To fix: run /ts-profile-thoughtspot → U → Refresh credential,\n"
+            "then reload your shell (macOS/Linux: source ~/.zshenv | Windows: restart terminal)."
+        )
+
+    def _token_from(self, resp: requests.Response) -> Tuple[str, Optional[int]]:
+        """(token, expiry_ms) from a 2xx `auth/token/full` answer; a clean exit, like a
+        401/403, when it carries no token — never a KeyError traceback."""
+        try:
+            data = resp.json()
+        except ValueError:  # not JSON: no token either
+            data = None
+        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            raise SystemExit(
+                f"Authentication failed for profile '{self._profile_name}': the token "
+                f"endpoint answered {resp.status_code} without a token.\nCheck the profile's "
+                "base URL, then run /ts-profile-thoughtspot → U → Refresh credential.")
+        return token, data.get("expiration_time_in_millis")
+
+    def _authenticate(self) -> Tuple[str, Optional[int]]:
+        """Authenticate and return (bearer_token, expiry_ms)."""
+        p = self._profile
+
+        if p.get("token_env"):
+            token = self._get_credential(p["token_env"])
+            return token, None  # browser tokens have no API-derived expiry
+
+        if p.get("password_env"):
+            password = self._get_credential(p["password_env"])
+            body = {"username": p["username"], "password": password, "validity_time_in_sec": 3600,
+                    **self._org_auth_fields()}
+            resp = self._session.post(
+                f"{self._base_url}/api/rest/2.0/auth/token/full",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            if resp.status_code in (401, 403):
+                raise SystemExit(
+                    f"Authentication failed ({resp.status_code}) for profile '{self._profile_name}'.\n"
+                    "Password may be wrong or expired.\n"
+                    "Run /ts-profile-thoughtspot → U → Refresh credential."
+                )
+            resp.raise_for_status()
+            return self._token_from(resp)
+
+        if p.get("secret_key_env"):
+            secret_key = self._get_credential(p["secret_key_env"])
+            body = {"username": p["username"], "secret_key": secret_key, "validity_time_in_sec": 3600,
+                    **self._org_auth_fields()}
+            resp = self._session.post(
+                f"{self._base_url}/api/rest/2.0/auth/token/full",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            if resp.status_code in (401, 403):
+                raise SystemExit(
+                    f"Authentication failed ({resp.status_code}) for profile '{self._profile_name}'.\n"
+                    "Secret key may be wrong or expired.\n"
+                    "Run /ts-profile-thoughtspot → U → Refresh credential."
+                )
+            resp.raise_for_status()
+            return self._token_from(resp)
+
+        raise SystemExit(
+            f"Profile '{self._profile_name}' has no auth credential configured "
+            "(expected one of: token_env, password_env, secret_key_env)."
+        )
+
+    # ------------------------------------------------------------------
+    # Token access
+    # ------------------------------------------------------------------
+
+    def get_token(self) -> str:
+        if self._token:
+            return self._token
+        cached = self._read_cached_token()
+        if cached:
+            self._token = cached
+            return self._token
+        token, expiry_ms = self._authenticate()
+        self._write_cached_token(token, expiry_ms)
+        self._token = token
+        return self._token
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _auth_headers(self, *, multipart: bool = False) -> Dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.get_token()}",
+            "Accept": "application/json",
+        }
+        if not multipart:
+            # A multipart/form-data request (files= in kwargs) must leave
+            # Content-Type unset — requests/urllib3 compute the boundary and
+            # set the header themselves when preparing the body. Forcing
+            # application/json here would ship a boundary-less multipart
+            # body under a JSON content type, which the server cannot parse.
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        raise_for_status: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        extra_headers = kwargs.pop("headers", {})
+        timeout = kwargs.pop("timeout", 60)
+        # `idempotent=` overrides the path-based default for a caller that knows better.
+        idempotent = kwargs.pop("idempotent", None)
+        idempotent = _is_idempotent(method, path) if idempotent is None else idempotent
+        url = f"{self._base_url}{path}"
+        allow_401_retry = path != _AUTH_TOKEN_PATH
+
+        # A dict `data=` is a form body: requests sets its form Content-Type, which a
+        # forced application/json would override (the v1 /dependency family answers 415).
+        is_multipart = "files" in kwargs or isinstance(kwargs.get("data"), dict)
+        retried_401 = False
+        transient_attempts = 0
+        while True:
+            headers = dict(extra_headers)
+            headers.update(self._auth_headers(multipart=is_multipart))
+            try:
+                resp = self._session.request(method, url, headers=headers, timeout=timeout, **kwargs)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as exc:
+                # Dropped connection / read timeout — transient. Retry with
+                # backoff, then fail cleanly (no traceback) if it persists. A
+                # create/import is retried only if it provably never arrived.
+                _refuse_ambiguous_retry(idempotent, method, url, exc=exc)
+                if transient_attempts < _RETRY_MAX:
+                    transient_attempts += 1
+                    print(
+                        f"ThoughtSpot API network error on {method} {url} "
+                        f"({type(exc).__name__}) — retry {transient_attempts}/{_RETRY_MAX}...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(_RETRY_BACKOFF_S * (2 ** (transient_attempts - 1)))
+                    continue
+                print(
+                    f"ThoughtSpot API network error on {method} {url} after "
+                    f"{_RETRY_MAX} retries: {exc}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
+            # A gateway fault on a create/import is ambiguous (a 504 means the
+            # upstream was still working) — report it, never repeat it.
+            _refuse_ambiguous_retry(idempotent, method, url, status=resp.status_code)
+            if resp.status_code in _RETRY_STATUSES and transient_attempts < _RETRY_MAX:
+                # Transient gateway fault (502/503/504) — retry with backoff.
+                # Prevents a flaky instance from hard-failing the call (and a
+                # 504 HTML body from reaching a caller's .json() as a traceback).
+                transient_attempts += 1
+                print(
+                    f"ThoughtSpot API {resp.status_code} on {method} {url} "
+                    f"(transient) — retry {transient_attempts}/{_RETRY_MAX}...",
+                    file=sys.stderr,
+                )
+                time.sleep(_RETRY_BACKOFF_S * (2 ** (transient_attempts - 1)))
+                continue
+
+            if resp.status_code == 401 and allow_401_retry and not retried_401:
+                # A cached token_env token has no server-verified expiry and is
+                # otherwise treated valid for ~23h (_read_cached_token) — a 401 here
+                # means the token was actually rotated/revoked server-side, not
+                # merely due for a routine refresh. Clear the stale cache; the next
+                # loop pass's _auth_headers() -> get_token() call forces one fresh
+                # authentication. retried_401 bounds this to exactly one retry — if
+                # the fresh token still 401s, fall through and report that failure.
+                print(
+                    f"ThoughtSpot API 401 on {method} {url} — clearing cached token "
+                    "and re-authenticating...",
+                    file=sys.stderr,
+                )
+                self.clear_token_cache()
+                self._token = None
+                retried_401 = True
+                continue
+            break
+
+        if raise_for_status and not resp.ok:
+            # Central, traceback-free failure path: one diagnostic line on stderr,
+            # exit 1. Callers that need the raw status in a 2xx body (e.g. tables
+            # import, where JDBC errors arrive as 200) are unaffected — those never
+            # reach here. Skill code piping our stdout JSON gets a clean signal.
+            print(format_http_error(method, url, resp), file=sys.stderr)
+            raise SystemExit(1)
+        return resp
+
+    def get(self, path: str, **kwargs: Any) -> requests.Response:
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path: str, **kwargs: Any) -> requests.Response:
+        return self.request("POST", path, **kwargs)
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def org(self) -> str:
+        """The Org this client is scoped to ("" = the user's default Org)."""
+        return str(self._org or "")

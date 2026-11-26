@@ -1,0 +1,173 @@
+---
+name: ts-convert-from-sisense
+description: Convert or import a Sisense dashboard into ThoughtSpot — parses a captured OFFLINE Sisense bundle JSON ({dashboard, widgets, datamodel}), generates Table + Model TML and Answers/tabbed Liveboard, translates JAQL (aggregations + the deterministic formula subset), validates and imports. Direction is always Sisense → ThoughtSpot. Not for ThoughtSpot → Sisense, and not a live Sisense fetch — the input is a bundle already on disk.
+metadata:
+  category: Conversion
+  platform: Sisense
+  coverage: "references/coverage-matrix.md"
+  summary: "Convert a captured offline Sisense bundle (`{dashboard, widgets, datamodel}`) into ThoughtSpot Table + Model TMLs and Answers/tabbed Liveboard, translating JAQL aggregations and the deterministic formula subset"
+---
+
+# Sisense Dashboard → ThoughtSpot
+
+Converts a captured Sisense bundle into ThoughtSpot objects through the `ts sisense` CLI:
+parse the offline bundle JSON (`{dashboard, widgets, datamodel}`) → build Table + Model TML →
+build Answers and one tabbed Liveboard → validate and import. Anything it cannot faithfully
+translate is flagged for a human in the migration report (`mapping.json`), never silently
+downgraded.
+
+The input is an **offline bundle already on disk** — there is no live Sisense REST fetch
+(that is an open item). Capture `{dashboard, widgets, datamodel}` from Sisense first, then
+point the CLI at that file.
+
+Ask one question at a time for **dependent** decisions (where the next depends on the answer);
+**batch independent** questions into a single prompt to keep the migration fast.
+
+## References
+
+| File | Purpose |
+|---|---|
+| [../../shared/mappings/sisense/sisense-formula-translation.md](../../shared/mappings/sisense/sisense-formula-translation.md) | JAQL → ThoughtSpot formula and function mapping |
+| [../../shared/schemas/thoughtspot-model-tml.md](../../shared/schemas/thoughtspot-model-tml.md) | Model TML structure + critical invariants |
+| [../../shared/schemas/thoughtspot-table-tml.md](../../shared/schemas/thoughtspot-table-tml.md) | Table TML structure |
+| [../../shared/schemas/thoughtspot-answer-tml.md](../../shared/schemas/thoughtspot-answer-tml.md) | Answer/visualization TML structure |
+| [../../shared/schemas/thoughtspot-liveboard-tml.md](../../shared/schemas/thoughtspot-liveboard-tml.md) | Liveboard TML structure |
+| [../../shared/schemas/thoughtspot-chart-types.md](../../shared/schemas/thoughtspot-chart-types.md) | Verified `answer.chart.type` enum |
+| [../../shared/worked-examples/sisense/numeric-range-filter-to-chip.md](../../shared/worked-examples/sisense/numeric-range-filter-to-chip.md) | Dashboard numeric-range filter → Liveboard filter chip preset |
+| [../../shared/worked-examples/sisense/date-bucket-granularity.md](../../shared/worked-examples/sisense/date-bucket-granularity.md) | Sisense date `level` → ThoughtSpot date bucket |
+| [../ts-profile-thoughtspot/SKILL.md](../ts-profile-thoughtspot/SKILL.md) | ThoughtSpot auth setup |
+| [references/coverage-matrix.md](references/coverage-matrix.md) | Mapped/unmapped JAQL + widget construct matrix |
+| [references/open-items.md](references/open-items.md) | Known quirks / unverified items |
+
+## Prerequisites
+
+- ThoughtSpot profile configured — run `/ts-profile-thoughtspot` if not.
+- `ts` CLI installed: `pip install -e tools/ts-cli`.
+- A captured **offline Sisense bundle JSON** on disk — a single `{dashboard, widgets,
+  datamodel}` object. The datamodel side (`datasets[].schema.tables[]` + `relations[]`) is
+  what the model path needs; `dashboard` + `widgets` drive the liveboard. There is **no live
+  Sisense fetch** — assemble the bundle from a Sisense export first (open-item #3).
+- The source tables already exist in a warehouse and a ThoughtSpot connection exposes them.
+  This skill creates ThoughtSpot *logical* objects (Table, Model, Answers, Liveboard) over
+  existing physical tables; it does not load data.
+
+## Workflow
+
+### Step 0 — Parse
+```bash
+ts sisense parse --input <bundle.json> --output /tmp/sisense_inv.json
+```
+Emits tables, columns, relations (from the datamodel) plus a best-effort parse of widgets
+and dashboard filters. Read it; note any `warnings` (the parser flags what it could not
+confidently read rather than guessing).
+
+### Step 1 — Build the model
+
+> **MANDATORY (I7) — before classifying any JAQL formula as untranslatable, open
+> [`../../shared/mappings/sisense/sisense-formula-translation.md`](../../shared/mappings/sisense/sisense-formula-translation.md)
+> and check its "Aggregations — plain JAQL `agg`" table, its `FUNCTION_MAP` function table, and the
+> Approximated table. Do not decide from syntax alone.**
+> See `../../shared/schemas/ts-model-conversion-invariants.md` (I7).
+
+```bash
+ts sisense build-model --input <bundle.json> --connection "<TS connection>" \
+  --database <DATABASE> --schema <SCHEMA> --model-name "<Model name>" --out out/ \
+  [--join-type LEFT_OUTER] [--lower-db-table] [--overrides overrides.json]
+```
+Emits Table TMLs + Model TML + `mapping.json`. Every join runs from the fact (MANY) side to
+the dimension (ONE) side — the side carrying more distinct join keys is the fact, then fewer
+shared keys, more measures, more relations, and table name — and carries the relation's
+cardinality (default MANY_TO_ONE). The same bundle always yields the same join graph. Plain JAQL aggregations map via the aggregation map
+(`sum`→SUM, `avg`→AVERAGE, …); calculated-column formulas translate through the deterministic
+JAQL subset. Window / time-intelligence / population-stats / R are flagged NEEDS REVIEW —
+never faked. `--lower-db-table` lowercases `db_table` for Databricks (folds unquoted names).
+Read `mapping.json`.
+
+### Step 2 — Validate & import the model
+Lint locally first (structural invariants the server accepts silently), then import:
+```bash
+ts tml lint --dir out/ --pattern '*.tml'
+ts tml import --dir out/ --pattern '*.table.tml' --pattern '*.model.tml' --order tableau \
+  --policy ALL_OR_NONE --profile <name>
+```
+`--order tableau` imports tables before the model. `--pattern` keeps `mapping.json` out:
+`--dir` alone reads every `.json` file in `out/` as a document, and under `ALL_OR_NONE` one
+document that is not TML would put the whole import at risk. If the engine rejects a formula, drop it
+(and any column that depends on it) and re-import — what lands is guaranteed to work, and the
+report records what was pruned.
+
+### Step 3 — Build the liveboard
+```bash
+ts sisense build-liveboard --input <bundle.json> --model-name "<Model name>" --out out/ \
+  [--model-fqn <model-guid>] [--report-name "<Liveboard name>"] \
+  [--connection "<TS connection>"] [--database <DATABASE>] [--schema <SCHEMA>] \
+  [--join-type LEFT_OUTER] [--lower-db-table] [--overrides overrides.json]
+```
+Widgets become Answers on the tabbed Liveboard: the Sisense widget type picks the chart
+(`chart/column`→COLUMN, `indicator`→KPI with a y axis, `tablewidget`→GRID_TABLE, …); JAQL
+panels map to roles (Categories→x, Break-by→color, Values→y); a date `level` becomes a
+matching date bucket (`months`→MONTHLY) so it sorts chronologically; a per-attribute top-N is
+baked into the widget answer; hidden (`disabled`) panel items are left out. The dashboard
+filter bar becomes cross-viz Liveboard filter chips (member→IN, exclude→NOT_IN, numeric
+range→GE/GT/LE/LT/BW_INC/BW/EQ — see the worked example).
+
+Widget measures become **Answer formulas** (rules in the mapping doc, "Widget measures →
+Answer formulas"):
+- a **measured value** `(count([id]), [Status])` → `group_aggregate ( unique_count_if (
+  [Status] = 'HIRED' , [id] ) , … , query_filters ( ) - { [Status] } )`: its own filter
+  replaces any filter on that column, as in Sisense;
+- a **widget filter** goes into the search, except on a column that also has a dashboard
+  filter: a Liveboard filter on a column replaces the tile's filter, so there it is folded into
+  each measure as a condition;
+- **`metadata.ignore`** (dashboard filters the widget does not take) → `group_aggregate ( agg ,
+  { } , query_filters ( ) - { [col] } )`, and `ignore.all` → `group_aggregate ( agg , { } , { } )`
+  (`query_groups ( )` instead of `{ }` on a grouped chart);
+- a **pivot** with no Columns panel, or whose Columns dimension has a member list, is emitted as
+  a flat GRID_TABLE (one conditional measure per member): PIVOT_TABLE refuses a large unfiltered
+  result. A pivot whose column values are unknown is kept and noted — flatten it by hand if its
+  rows are high-cardinality.
+
+### When a Sisense table becomes a hand-written SQL view
+The CLI does not emit SQL views. When you rebuild a Sisense custom table or cube as a
+ThoughtSpot SQL view that `UNION`s timestamp columns from several sources, cast every
+timestamp branch to one type — on Snowflake `::TIMESTAMP_NTZ`: a union mixing NTZ with TZ/LTZ
+columns fails there (open-item #7).
+
+Each Answer is emitted via the shared emitter's `build_answer` using the Sisense-resolved
+chart type directly, so the widget-type mapping wins and the Approximated / NEEDS REVIEW
+signal survives into the report (a widget that can't be mapped is flagged, never silently
+downgraded). Lint, then import the emitted TML:
+```bash
+ts tml lint --dir out/ --pattern '*.tml'                 # now includes the liveboard
+ts tml import --dir out/ --pattern '*.tml' --order tableau --policy ALL_OR_NONE --profile <name>
+ts tml verify-render <liveboard-guid> --profile <name>    # post-import gate; exit 1 = broken board
+```
+
+> **Why lint again here.** Step 2's lint runs before the liveboard is emitted, so it
+> cannot see the tile — the same ordering gap found in the Qlik skill (audit finding
+> 17.3). This converter routes through the shared `build_answer`, which already sets
+> `axis_configs`, so nothing is expected to fire; the gate is here so a future change to
+> the shared emitter cannot ship blank boards unnoticed.
+
+### Step 4 — Migration report
+`mapping.json` accounts for every table, measure, and widget with a status (Migrated /
+Approximated / NEEDS REVIEW / Skipped), plus `warnings`. Hand it to the user as the
+deliverable, calling out every NEEDS REVIEW row (window/time-intelligence formulas, unknown
+widgets, unresolved fields) for manual rebuild.
+
+---
+
+## Changelog
+
+| Version | Date | Summary |
+|---|---|---|
+| 1.1.0 | 2026-11-26 | **Widget measures reach ThoughtSpot (ts-cli 0.225.0).** A widget's formula measures were reported as unmapped and the tile dropped, so a Sisense indicator never converted; they are now Answer formulas. A measured value `(agg, [Dim])` was copied verbatim as a tuple ThoughtSpot cannot parse and marked Migrated; it is now `group_aggregate` over a conditional aggregate that drops query filters on `[Dim]`. Widget filters reach the search, or fold into the measures when the column also has a Liveboard filter; `metadata.ignore` maps to `group_aggregate` filter sets; indicators are KPI tiles with a y axis; pivots without a Columns panel, or with a member list on it, are flat `TABLE_MODE` grids; hidden panel items are dropped. Verified by import and data read-back on a cluster (open-item #6). New guidance for SQL views that union timestamps (open-item #7) |
+| 1.0.8 | 2026-11-08 | **The aggregation table no longer maps `count` to `COUNT_DISTINCT` (BL-447).** Sisense `count` is a distinct count; the mapping doc and coverage matrix now give the `unique count` formula, as invariant I5 requires. The uncalled `AGG_MAP` / `translate_agg` behind that row was deleted; no Model output changes |
+| 1.0.7 | 2026-11-08 | **Lint and import read TML only (BL-545).** Steps 2 and 3 read `--dir out/` with no filter, which also reads `mapping.json` as a document, so the `ALL_OR_NONE` import sent it to ThoughtSpot beside the Tables and Model. Both steps now add `--pattern`: Step 2 imports `*.table.tml` and `*.model.tml`, Step 3 imports every `*.tml` (Tables, Model, Liveboard and its Answers) |
+| 1.0.6 | 2026-11-04 | **Calculated-column formulas are surfaced again, and declare an aggregation.** A migrated calc column's formula was emitted with no `columns[]` entry binding it (the name-collision pass dropped the formula's own column with the physical one it replaces), so it never appeared in the Model; its column is now kept, and a MEASURE one carries `aggregation:` (BL-509). |
+| 1.0.5 | 2026-10-22 | **An explicit many-to-many relation is no longer emitted as a join (BL-397).** ThoughtSpot rejects a `MANY_TO_MANY` Model join at import (error 14528), so it is left out and flagged NEEDS REVIEW, pointing at a warehouse bridge table. Sisense v2 bundles rarely carry cardinality; the default case is unchanged. |
+| 1.0.4 | 2026-10-21 | **Join direction is deterministic and fact → dimension (ts-cli v0.179.0, BL-398).** The source side of each join was picked by a sort over a set, so on tied connection counts the join graph varied run to run and two facts sharing dimensions could fail `ts tml lint` I17. Tables are now ranked once (distinct join keys, shared keys, measures, connections, name). Coverage matrix updated |
+| 1.0.3 | 2026-10-07 | **Quote-bearing literals and `a * b / c` are exact (ts-cli v0.165.0, BL-365).** A literal with a quote is emitted double-quoted (read SQL-standard: `''` is one quote), a backslash doubled, and every product under a division bracketed |
+| 1.0.2 | 2026-10-06 | **2-arg `round` no longer imports as a wrong number (ts-cli v0.156.0, BL-331).** It was emitted verbatim and marked Approximated, but Approximated still imports: `round(x, 0)` was NULL on every row and `round(x, 2)` rounded to the nearest 2. A literal decimal count now converts to ThoughtSpot's increment (`2` → `0.01`) and is Migrated; a non-literal one is NEEDS REVIEW. Coverage matrix updated |
+| 1.0.1 | 2026-09-22 | **I7 untranslatable gate added.** Step 1 flagged JAQL formulas NEEDS REVIEW with no instruction to open [sisense-formula-translation.md](../../shared/mappings/sisense/sisense-formula-translation.md) first. Now gated by `check_i7_gate.py`, which requires the literal `MANDATORY (I7)` marker in a blockquote citing this skill's own dialect mapping and the invariants doc (2026-09-22 audit finding 9.3). |
+| 1.0.0 | 2026-07-17 | Initial release — `ts sisense` parse / build-model / build-liveboard |

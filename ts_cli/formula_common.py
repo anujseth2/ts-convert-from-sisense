@@ -1,0 +1,991 @@
+"""Platform-neutral formula/name transforms shared by the Tableau and Databricks
+model builders.
+
+Relocated from ts_cli/model_builder.py + ts_cli/tableau/naming.py (BL-063 PR 5) —
+these encode ThoughtSpot TML semantics (formula_ cross-reference prefix,
+double-aggregation collapse, column/formula/parameter collision rules), not any
+source platform's. Pure functions, stdlib only (a constraint from the retired Genie
+runtime's vendored closure, no longer required — see ``ts_cli/databricks/__init__.py``).
+Never fork these into a platform module; import them.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# SQL CAST target type -> ThoughtSpot conversion function
+# ---------------------------------------------------------------------------
+#
+# Shared so a fix in one engine cannot silently miss the other — the divergence
+# BL-161 item 1 predicted and audit 4.1 found had already happened: the Databricks
+# clone discarded the target type outright while Snowflake mapped it.
+#
+# The two engines legitimately differ on WIDENING casts, and that is deliberate:
+#
+#   * Snowflake emits the conversion (CAST(x AS DOUBLE) -> to_double([x])), which
+#     ts-snowflake-formula-translation.md documents and `to_double` is a valid
+#     ThoughtSpot formula function (thoughtspot-formula-patterns.md).
+#   * Databricks unwraps it, which ts-from-databricks.md documents. Justified by
+#     live test on se-thoughtspot 2026-08-26:
+#         SELECT SUM("UNITS_SOLD") / COUNT("ORDER_ID")  ->  type DOUBLE, 5128.71
+#     Both operands are INT64, so ThoughtSpot promotes integer division itself and
+#     a CAST(... AS DOUBLE) around a numerator is genuinely redundant.
+#
+# What is NOT optional is a NARROWING cast. Dropping one changes the answer, and
+# that was the real 4.1 bug on the Databricks side:
+#     CAST(4.7 AS INT)  must truncate to 4
+#     CAST(ts AS DATE)  must drop the time component
+#
+#: Casts whose target type changes the VALUE. Every engine MUST emit these;
+#: dropping one is a silent wrong-numbers bug.
+CAST_MAP_LOAD_BEARING = {
+    "INTEGER": "to_integer", "INT": "to_integer", "BIGINT": "to_integer",
+    "SMALLINT": "to_integer", "TINYINT": "to_integer",
+    "DATE": "to_date", "TIMESTAMP": "to_date",
+    "BOOLEAN": "to_bool",
+}
+
+#: Widening / no-op casts. Enumerated rather than defaulted so a genuinely
+#: UNKNOWN target type still fails loudly instead of silently unwrapping.
+CAST_TYPES_WIDENING = frozenset({
+    "NUMBER", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL",
+    "VARCHAR", "TEXT", "STRING", "CHAR",
+})
+
+#: Load-bearing + widening, for engines that emit a conversion for every
+#: recognised target (Snowflake). Keeps sv_sql's behaviour unchanged.
+CAST_MAP_FULL = {
+    **CAST_MAP_LOAD_BEARING,
+    "NUMBER": "to_double", "FLOAT": "to_double", "DOUBLE": "to_double",
+    "DECIMAL": "to_double", "NUMERIC": "to_double", "REAL": "to_double",
+    "VARCHAR": "to_string", "TEXT": "to_string", "STRING": "to_string",
+    "CHAR": "to_string",
+}
+
+#: Back-compat alias.
+CAST_MAP = CAST_MAP_FULL
+
+
+# ---------------------------------------------------------------------------
+# round(): SQL digit count <-> ThoughtSpot rounding increment (BL-331)
+# ---------------------------------------------------------------------------
+#
+# ThoughtSpot `round(x, n)` takes a rounding INCREMENT, not a decimal-place count.
+# It compiles to `n * round(x / NULLIF(n, 0))` (seen via `ts agentql generate-sql`,
+# live-probed on se-thoughtspot 2026-10-06). On 1234.5678:
+#     round(x) = 1235     round(x, 1) = 1235      round(x, 0.01) = 1234.57
+#     round(x, 2) = 1234  round(x, 10) = 1230     round(x, 0.5)  = 1234.5
+#     round(x, 0) = NULL  round(x, -2) = 1234
+# SQL `ROUND(x, d)` (Snowflake, Databricks, Tableau, DAX) takes a digit count, so
+# every translator must convert: d -> 10^-d one way, a power-of-ten increment -> d
+# the other. Copying the argument verbatim is a silent wrong-numbers bug (it shipped
+# in four translators). One copy of the conversion, here; never re-implement it.
+
+# An integer literal, optionally signed/parenthesised, optionally written `2.0`.
+_SQL_INT_LITERAL_RE = re.compile(r"^\(?\s*([+-])?\s*(\d+)(?:\.0*)?\s*\)?$")
+
+#: Largest |digit count| accepted. Snowflake NUMBER scale tops out at 37 and its
+#: ROUND scale range is about +-38; past that a "digit count" is an authoring error.
+MAX_ROUND_DIGITS = 37
+
+
+def sql_int_digits(digits: str) -> int | None:
+    """An integer-literal digit count (``"2"``, ``"- 2"``, ``"2.0"``) as int, else None."""
+    m = _SQL_INT_LITERAL_RE.match((digits or "").strip())
+    if not m:
+        return None
+    return int(m.group(2)) * (-1 if m.group(1) == "-" else 1)
+
+
+def sql_digits_to_ts_increment(digits: str) -> str | None:
+    """SQL ROUND digit count -> ThoughtSpot round() increment, as literal text.
+
+    ``"2"`` / ``"2.0"`` -> ``"0.01"``, ``"0"`` -> ``"1"``, ``"-2"`` / ``"- 2"`` ->
+    ``"100"``. Returns None when ``digits`` is not an integer literal (a column,
+    an expression, a fraction) or exceeds MAX_ROUND_DIGITS in magnitude — the
+    caller must pass it through, refuse it, or flag it.
+    """
+    from decimal import Decimal
+    d = sql_int_digits(digits)
+    if d is None or abs(d) > MAX_ROUND_DIGITS:
+        return None
+    return format(Decimal(1).scaleb(-d), "f")
+
+
+def ts_round_from_sql_digits(x: str, digits: str | None = None, *,
+                             aggregated: bool = False) -> str:
+    """SQL ``ROUND(x[, d])`` -> ThoughtSpot formula text (spaced token style).
+
+    Literal d -> ``round ( x , 10^-d )``; absent d -> ``round ( x )``; a
+    non-literal d has no native increment form, so it passes through to the
+    warehouse unchanged: ``sql_double_op ( "ROUND({0}, {1})" , x , d )``.
+
+    That pass-through is row-level, so a non-literal d over an aggregated x
+    raises UntranslatableError rather than emit it. ``aggregated=True`` tells it x is aggregated when the text cannot
+    show it (a ``[formula_X]`` reference to a metric). A literal d beyond
+    +-MAX_ROUND_DIGITS always raises.
+    """
+    if digits is None:
+        return f"round ( {x} )"
+    inc = sql_digits_to_ts_increment(digits)
+    if inc is not None:
+        return f"round ( {x} , {inc} )"
+    if sql_int_digits(digits) is not None:
+        raise UntranslatableError(
+            f"ROUND digit count {digits.strip()} is outside "
+            f"+-{MAX_ROUND_DIGITS} — BL-331")
+    if aggregated or expr_is_aggregated(x):
+        raise UntranslatableError(
+            "ROUND with a non-literal digit count over an aggregate has no "
+            "ThoughtSpot form (round() takes an increment; the sql_double_op "
+            "pass-through is row-level) — BL-331")
+    return f'sql_double_op ( "ROUND({{0}}, {{1}})" , {x} , {digits} )'
+
+
+# ---------------------------------------------------------------------------
+# Directed rounding at a decimal scale: ceil / floor of x * 10^n (BL-348, #577 review)
+# ---------------------------------------------------------------------------
+
+#: The nudge that absorbs binary representation error before ``ceil`` / ``floor``.
+NUDGE = "0.000000001"
+#: The largest power of ten a ThoughtSpot ``/`` can scale back by exactly: an integer divided
+#: by an integer keeps scale 6 in Snowflake (live 2026-10-07), so ``ceil ( … ) / 10^n`` is exact
+#: for n <= 6 and cut beyond; past it the increment ``* 10^-n`` keeps the digits (with float
+#: noise in the last place).
+MAX_EXACT_DIVISOR_DIGITS = 6
+
+
+def nudged(inner: str, mode: str, is_double: bool) -> str:
+    """``inner`` ready for ``mode`` (``ceil`` / ``floor``): a DOUBLE is nudged toward the step
+    below (``ceil ( v - 1e-9 )``) or above (``floor ( v + 1e-9 )``), so representation error —
+    ``1.1 * 100`` is ``110.00000000000001`` — does not cross a step, as Excel (15 significant
+    digits) does not. The trade-off: a genuine value within 1e-9 of a step is read as on it.
+    ``round ( v , 1e-9 )`` is NOT this: it compiles to ``1.0E-9 * round ( v / 1.0E-9 )``, whose
+    double multiply-back lands about one ulp above the integer, so ``ceil`` jumped a whole step
+    (3.0 scaled by 10 gave 3.1; live 2026-10-07, probe record §7). Exact inputs (a literal, an
+    integer or DECIMAL column) are not nudged."""
+    if mode not in ("ceil", "floor"):
+        raise ValueError(f"mode must be ceil or floor, not {mode!r}")
+    if not is_double:
+        return inner
+    return f"{inner} {'-' if mode == 'ceil' else '+'} {NUDGE}"
+
+
+def scaled_ceil_floor(x: str, n: int, mode: str, is_double: bool) -> str:
+    """ThoughtSpot text for ``mode ( x * 10^n ) / 10^n`` — ``x`` rounded up (``ceil``) or down
+    (``floor``) at ``n`` decimal places (``n < 0``: to tens, hundreds, …). ``x`` is ThoughtSpot
+    text, bracketed by the caller if it is not a primary.
+
+    Scaled back by DIVISION by the power of ten, which is exact (``* 0.1`` gives
+    0.30000000000000004): ``/ 10^n`` for 1 <= n <= 6, the increment beyond (scale 6, see
+    ``MAX_EXACT_DIVISOR_DIGITS``). A negative ``n`` divides first and multiplies back by the
+    integer ``10^-n``, both exact."""
+    from decimal import Decimal
+    if n == 0:
+        return f"{mode} ( {nudged(x, mode, is_double)} )"
+    factor = format(Decimal(10) ** abs(n), "f")
+    if n < 0:
+        return f"{mode} ( {nudged(f'{x} / {factor}', mode, is_double)} ) * {factor}"
+    core = f"{mode} ( {nudged(f'{x} * {factor}', mode, is_double)} )"
+    if n <= MAX_EXACT_DIVISOR_DIGITS:
+        return f"{core} / {factor}"
+    return f"{core} * {format(Decimal(1).scaleb(-n), 'f')}"
+
+
+def ts_increment_to_sql_digits(increment: str) -> int | None:
+    """ThoughtSpot round() increment literal -> SQL ROUND digit count.
+
+    ``"0.01"`` -> 2, ``"1"`` -> 0, ``"100"`` -> -2. Returns None when the
+    increment is not a positive power of ten (``"0.5"``, ``"25"``, a non-number)
+    — the caller emits ``inc * ROUND(x / inc)`` instead, which is the form
+    ThoughtSpot itself compiles round() to, so it agrees for any increment. Raises ValueError for a zero increment: ThoughtSpot evaluates
+    ``round(x, 0)`` to NULL, so there is no faithful ``ROUND(x, d)`` for it.
+    """
+    from decimal import Decimal, InvalidOperation
+    try:
+        value = Decimal((increment or "").strip())
+    except InvalidOperation:
+        return None
+    if not value.is_finite():
+        return None
+    if value == 0:
+        raise ValueError("round(x, 0) evaluates to NULL in ThoughtSpot "
+                         "(the increment divides by NULLIF(0, 0))")
+    if value < 0:
+        return None
+    _sign, digit_tuple, exponent = value.normalize().as_tuple()
+    if digit_tuple != (1,):
+        return None
+    return -exponent
+
+
+# ---------------------------------------------------------------------------
+# Weekday numbering -> ThoughtSpot day_number_of_week (BL-334)
+# ---------------------------------------------------------------------------
+#
+# ThoughtSpot `day_number_of_week ( d )` is FIXED at 1 = Monday ... 7 = Sunday:
+# it compiles to `(MOD((DATEDIFF(day, DATE '1970-01-01', d) + 3), 7) + 1)`,
+# independent of the warehouse's WEEK_START (live-probed, se-thoughtspot,
+# 2026-10-06). Every source numbers its weekdays from some FIRST DAY with some
+# BASE (0 or 1), and a bare rename to `day_number_of_week` is right only for
+# (Monday, 1). Anything else imports cleanly and returns a silently wrong number
+# — Snowflake DAYOFWEEK and Databricks DAYOFWEEK both shipped that way.
+#
+# One helper so the offset arithmetic lives once (BL-217): a source day number
+# is  mod(dnw - 1 - first_idx, 7) + base  ==  mod(dnw + (6 - first_idx), 7) + base,
+# where first_idx is the source's first day, Monday-based (Monday = 0 ... Sunday
+# = 6). Exact under the Model's default calendar; a Model calendar with a
+# non-Monday week start is unverified territory (BL-334 item 4).
+
+WEEKDAY_FIRST_DAY_INDEX = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def ts_weekday_number(date_expr: str, *, first_day: int | str, base: int,
+                      compact: bool = False) -> str:
+    """ThoughtSpot formula giving a source's weekday NUMBER for ``date_expr``.
+
+    ``first_day`` is the day the source numbers ``base`` — a name
+    (``"sunday"``) or a Monday-based index (Monday = 0 ... Sunday = 6, which is
+    also Qlik's ``first_week_day`` encoding). ``base`` is 0 or 1. ``compact``
+    selects the caller's spacing style (``fn(x)`` vs ``fn ( x )``); the value is
+    identical. Any additive result is parenthesised so it composes safely inside
+    a larger expression.
+
+    >>> ts_weekday_number("[d]", first_day="sunday", base=0)
+    'mod ( day_number_of_week ( [d] ) , 7 )'
+    >>> ts_weekday_number("[d]", first_day="sunday", base=1)
+    '( mod ( day_number_of_week ( [d] ) , 7 ) + 1 )'
+    >>> ts_weekday_number("[d]", first_day="monday", base=1)
+    'day_number_of_week ( [d] )'
+    """
+    if isinstance(first_day, str):
+        try:
+            idx = WEEKDAY_FIRST_DAY_INDEX[first_day.strip().lower()]
+        except KeyError:
+            raise ValueError(f"unknown weekday name {first_day!r}") from None
+    else:
+        idx = int(first_day)
+    if not 0 <= idx <= 6:
+        raise ValueError(f"first_day index must be 0-6 (Monday-based), got {idx}")
+    if base not in (0, 1):
+        raise ValueError(f"weekday base must be 0 or 1, got {base}")
+
+    if compact:
+        dnw = f"day_number_of_week({date_expr})"
+
+        def _mod(x: str) -> str:
+            return f"mod({x}, 7)"
+
+        def _paren(x: str) -> str:
+            return f"({x})"
+    else:
+        dnw = f"day_number_of_week ( {date_expr} )"
+
+        def _mod(x: str) -> str:
+            return f"mod ( {x} , 7 )"
+
+        def _paren(x: str) -> str:
+            return f"( {x} )"
+
+    if idx == 0:  # Monday-first: a plain offset, no wrap-around
+        return dnw if base == 1 else _paren(f"{dnw} - 1")
+    shift = 6 - idx
+    core = _mod(dnw if shift == 0 else f"{dnw} + {shift}")
+    return core if base == 0 else _paren(f"{core} + {base}")
+
+
+# ---------------------------------------------------------------------------
+# Shared translation-failure exception
+# ---------------------------------------------------------------------------
+
+class UntranslatableError(Exception):
+    """A formula/expression construct has no deterministic translation to the
+    other platform's syntax.
+
+    Canonical home (BL-063 PR 14 — retired Genie vendor wiring): both the reverse
+    (Databricks-SQL -> ThoughtSpot formula, `mv_sql.py`) and forward
+    (ThoughtSpot formula -> Databricks-SQL, `mv_emit_expr.py`) directions
+    raise this SAME exception type for the same concept — "no documented
+    deterministic mapping exists" — so a single `except UntranslatableError`
+    catches either direction's failures. Concatenating both modules into the
+    retired Genie runtime's one vendored notebook namespace would have defined
+    the class twice under one name, which that runtime's build rejected. `mv_sql.py` and
+    `mv_emit_expr.py` both re-export this name (`from ts_cli.formula_common
+    import UntranslatableError`) so existing `from
+    ts_cli.databricks.mv_sql import UntranslatableError` / `from
+    ts_cli.databricks.mv_emit_expr import UntranslatableError` call sites are
+    unaffected.
+    """
+
+
+# ---------------------------------------------------------------------------
+# SQL pass-through and 1-based SUBSTR (BL-340 / BL-342 / BL-343)
+# ---------------------------------------------------------------------------
+#
+# Shared by sv_sql (Snowflake) and databricks/mv_sql so the two SQL engines
+# cannot drift apart again (BL-217): both copied SUBSTR's 1-based start into
+# ThoughtSpot's zero-based substr (BL-340).
+
+_SQL_NUM_LITERAL_RE = re.compile(r"^-?\s*\d+(?:\.\d+)?$")
+_SQL_STR_LITERAL_RE = re.compile(r"^'(?:[^']|'')*'$")
+_SQL_BOOL_LITERALS = frozenset({"true", "false"})
+
+
+def sql_passthrough_call(op: str, fn: str, args: list[str]) -> str:
+    """``op ( "FN(<args>)" , … )`` — a warehouse pass-through, exact by construction.
+
+    Numeric, string and boolean literals are inlined into the template
+    (``TO_CHAR({0}, 'YYYY-MM')``); every other argument becomes a ``{n}``
+    placeholder. Refused when no argument is a column (a pass-through needs one), or
+    when a string literal holds a brace (the template would read it as a
+    placeholder), a backslash, or a double quote. The double quote is a real loss — a
+    Snowflake format model's literal text, ``'YYYY"m"MM'`` — but the template has no
+    escape for it: ``\\"`` was live-probed and rejected at import (*Search did not find
+    "TO_CHAR ( { 0 } , 'YYYY"m"MM' ) "*, error_code 14516; formula fidelity M0
+    ``sf-date-018``, se-thoughtspot 2026-10-06).
+    """
+    parts: list[str] = []
+    bound: list[str] = []
+    literal_bound = 0
+    for a in args:
+        a = a.strip()
+        if _SQL_NUM_LITERAL_RE.match(a):
+            parts.append(a.replace(" ", ""))
+        elif a.lower() in _SQL_BOOL_LITERALS:
+            parts.append(a.upper())
+        elif _SQL_STR_LITERAL_RE.match(a) and "''" in a[1:-1] \
+                and not any(ch in a for ch in '"{}\\'):
+            # A quote inside the literal: bound, not inlined. The warehouses disagree on
+            # `''` (Databricks reads 'it''s' as `its`), and a bound literal is passed as
+            # the warehouse's own literal (BL-365; REPLACE with a bound "'" matched, live)
+            parts.append("{%d}" % len(bound))
+            bound.append(a)
+            literal_bound += 1
+        elif _SQL_STR_LITERAL_RE.match(a):
+            if any(ch in a for ch in '"{}\\'):
+                raise UntranslatableError(
+                    f"{fn}: literal {a} holds a double quote, a brace or a backslash, "
+                    "which a sql_*_op template cannot carry (no escape exists — "
+                    "live-probed 2026-10-06)")
+            parts.append(a)
+        else:
+            parts.append("{%d}" % len(bound))
+            bound.append(a)
+    if len(bound) == literal_bound:
+        raise UntranslatableError(f"{fn} with only literal arguments has no pass-through form")
+    template = f"{fn}({', '.join(parts)})"
+    return f'{op} ( "{template}" , ' + " , ".join(bound) + " )"
+
+
+def sql_substr_to_ts(fn: str, args: list[str]) -> str:
+    """1-based SQL ``SUBSTR(s, start[, len])`` → ThoughtSpot (BL-340).
+
+    ThoughtSpot ``substr`` is ZERO-based — ``substr ( s , 2 , 3 )`` compiles to
+    ``SUBSTRING(s, (2 + 1), 3)`` — and takes exactly three arguments.
+
+    * literal ``start >= 1``: native, folded — ``SUBSTR(s, 2, 3)`` → ``substr ( s , 1 , 3 )``;
+      the 2-argument form takes the rest of the string, ``strlen ( s )`` long.
+    * literal ``start <= 0``, or a non-literal ``start``: a ``sql_string_op`` pass-through.
+      Snowflake and Databricks both count a negative start from the END of the string
+      (and Snowflake treats 0 as 1), which ``substr`` does not define; a non-literal
+      start could be either at run time. The pass-through is exact by construction.
+    """
+    if len(args) not in (2, 3):
+        raise UntranslatableError(f"{fn} expects 2 or 3 arguments, got {len(args)}")
+    s, start = args[0], args[1]
+    n = sql_int_digits(start)
+    if n is None or n <= 0 or "." in start:
+        return sql_passthrough_call("sql_string_op", fn, args)
+    length = args[2] if len(args) == 3 else f"strlen ( {s} )"
+    return f"substr ( {s} , {n - 1} , {length} )"
+
+
+# ---------------------------------------------------------------------------
+# Name collision resolution
+# ---------------------------------------------------------------------------
+
+def resolve_name_collisions(
+    columns: list[dict],
+    formulas: list[dict],
+    parameters: list[dict],
+) -> tuple[list[dict], list[dict], dict[str, str]]:
+    """Detect and resolve name collisions between columns, formulas, parameters.
+
+    Rules:
+      - If a formula name matches a parameter name, rename the formula
+        (append " Selection" suffix)
+      - If a column name matches a formula name, drop the column (keep formula)
+      - Returns (cleaned_columns, renamed_formulas, rename_map)
+
+    rename_map: {old_name: new_name} for formulas that were renamed.
+    """
+    param_names = {p["name"] for p in parameters}
+    formula_names = {f["name"] for f in formulas}
+
+    rename_map: dict[str, str] = {}
+    for f in formulas:
+        if f["name"] in param_names:
+            new_name = f["name"] + " Selection"
+            rename_map[f["name"]] = new_name
+            f["name"] = new_name
+
+    new_formula_names = {f["name"] for f in formulas}
+    cleaned_columns = [
+        c for c in columns
+        if c["name"] not in new_formula_names
+    ]
+    dropped = len(columns) - len(cleaned_columns)
+
+    return cleaned_columns, formulas, rename_map
+
+
+# ---------------------------------------------------------------------------
+# Duplicate column_id → formula promotion (TML invariant I8/I5)
+# ---------------------------------------------------------------------------
+
+# Column-aggregation enum (columns[].properties.aggregation) → ThoughtSpot
+# formula aggregation function. Covers the enum values BOTH the from-Snowflake
+# (sv_translate._SIMPLE_AGG_MAP — STDDEV/MEDIAN) and from-Databricks
+# (mv_translate._COLUMN_AGG — STD_DEVIATION) builders emit, plus COUNT_DISTINCT
+# for the related I5 rule (a non-numeric COUNT_DISTINCT column silently flips
+# MEASURE → ATTRIBUTE; `unique count(...)` is the correct form).
+_AGG_TO_FORMULA_FN = {
+    "SUM": "sum",
+    "AVERAGE": "average",
+    "MIN": "min",
+    "MAX": "max",
+    "COUNT": "count",
+    "MEDIAN": "median",
+    "STDDEV": "stddev",
+    "STD_DEVIATION": "stddev",
+    "VARIANCE": "variance",
+    "COUNT_DISTINCT": "unique count",
+}
+
+
+def aggregate_formula(aggregation: str | None, operand: str) -> str | None:
+    """``fn ( operand )`` for a column-aggregation enum value, or None when the
+    value has no formula function. The shared spelling of an aggregation as a formula
+    (``unique count``, with its space). Today the Snowflake SV and Power BI builders and
+    :func:`promote_duplicate_column_ids` use it; Tableau, Qlik, Sisense, the Databricks
+    MV translator and dbt MetricFlow still write ``unique count`` from their own maps."""
+    fn = _AGG_TO_FORMULA_FN.get((aggregation or "").upper())
+    return f"{fn} ( {operand} )" if fn else None
+
+
+def unique_count_formula(operand: str, *, null_is_a_value: bool = False) -> str:
+    """A distinct count as a formula: ``unique count ( operand )`` (invariant I5).
+
+    A source's distinct count must never become ``aggregation: COUNT_DISTINCT``:
+    ThoughtSpot types a physical MEASURE by its data type, so on a text or date
+    column it is stored as an ATTRIBUTE and search lists values instead of counting
+    them, with no error (live-probed 2026-10-29). A formula column carrying it over a
+    bare ``[T::c]`` is demoted the same way. The formula works for every type, and on
+    an expression too (``unique count ( [T::c] + 1 )`` compiles to
+    ``count(DISTINCT (c + 1))``, live 2026-11-08).
+
+    ``unique count`` compiles to SQL ``count(DISTINCT …)``, which **ignores NULL**
+    (live 2026-11-08, BL-540: keys a, a, b, NULL, NULL, c gave 3). That is SQL's, Tableau's
+    ``COUNTD`` and DAX ``DISTINCTCOUNTNOBLANK``'s reading. A source that counts NULL (BLANK)
+    as one more value — DAX ``DISTINCTCOUNT`` — passes ``null_is_a_value=True`` and gets
+    ``( unique count ( x ) + max ( if ( isnull ( x ) ) then 1 else 0 ) )``, probed the same
+    day: 4 on those keys, and 1 for a group holding only NULL. It is bracketed so it
+    composes (as a divisor it must divide by the whole count). It is an approximation, not
+    exact: a dimension row with no matching facts is BLANK in DAX and 1 here, and it is
+    unprobed inside ``group_aggregate``."""
+    base = aggregate_formula("COUNT_DISTINCT", operand)
+    if not null_is_a_value:
+        return base  # type: ignore[return-value]
+    return f"( {base} + max ( if ( isnull ( {operand} ) ) then 1 else 0 ) )"
+
+
+def distinct_count_formula_column(
+    name: str, column_id: str, formula_id: str,
+    properties: dict | None = None, description: str | None = None,
+    *, null_is_a_value: bool = False,
+) -> tuple[dict, dict]:
+    """``(formula, column)`` for a Model column that counts distinct values of the
+    physical column ``column_id`` — the I5 form of a source column whose default
+    summarisation is a distinct count. ``name`` is the caller's choice, and the key
+    usually needs keeping beside it: Power BI keeps the key as an ATTRIBUTE under its own
+    name, so a visual that groups by it still groups, and names this column
+    ``<key> (Distinct Count)`` (giving the count the key's own name turned every grouping
+    into one total row, BL-447 re-review). ``properties`` carries over except
+    the aggregation; the column is a MEASURE declaring SUM (ThoughtSpot ignores it on
+    an aggregate formula; the 2026-11-02 convention) with ``index_type: DONT_INDEX``
+    (I3). ``null_is_a_value`` as for :func:`unique_count_formula`. Pair with
+    :func:`reselect_counted_columns` once the Model's columns are assembled."""
+    props = {k: v for k, v in (properties or {}).items() if k != "aggregation"}
+    props.update({"column_type": "MEASURE", "aggregation": "SUM"})
+    props.setdefault("index_type", "DONT_INDEX")
+    column: dict = {"name": name, "formula_id": formula_id}
+    if description:
+        column["description"] = description
+    column["properties"] = props
+    return ({"id": formula_id, "name": name,
+             "expr": unique_count_formula(f"[{column_id}]",
+                                          null_is_a_value=null_is_a_value)}, column)
+
+
+_UNIQUE_COUNT_HEAD_RE = re.compile(
+    r"^\s*(?:\(\s*)?unique count \(\s*\[([^\[\]:]+)::([^\[\]]+)\]\s*\)")
+
+
+def _counted_column(expr: str) -> tuple[str, str] | None:
+    """``(table, column)`` when ``expr`` is exactly a :func:`unique_count_formula` of one
+    ``[T::c]`` (either NULL reading), else None."""
+    m = _UNIQUE_COUNT_HEAD_RE.match(expr or "")
+    if not m:
+        return None
+    ref = f"[{m.group(1)}::{m.group(2)}]"
+    forms = (unique_count_formula(ref), unique_count_formula(ref, null_is_a_value=True))
+    return (m.group(1), m.group(2)) if expr.strip() in forms else None
+
+
+def reselect_counted_columns(columns: list[dict], formulas: list[dict]) -> list[str]:
+    """In place: keep selected every Table a ``unique count ( [T::c] )`` formula counts.
+
+    ThoughtSpot refuses a Model in which a table has no ``column_id`` entry ("One or
+    more tables have been added to the model without selecting any of their columns",
+    live 2026-09-02, see :func:`bare_column_name`). Turning a distinct-count column
+    into a formula removes its ``column_id`` entry, so when that was its table's only
+    one, the physical column is added back as an ATTRIBUTE under its own name (or
+    ``name (TABLE)`` when that is taken). Returns the display names added."""
+    by_id = {f.get("id"): f.get("expr") or "" for f in formulas if isinstance(f, dict)}
+    selected = {str(c["column_id"]).split("::", 1)[0]
+                for c in columns if isinstance(c, dict) and c.get("column_id")}
+    taken = {str(c.get("name", "")).lower() for c in columns if isinstance(c, dict)}
+    added: list[str] = []
+    for c in list(columns):
+        counted = _counted_column(by_id.get(c.get("formula_id"), "")) \
+            if isinstance(c, dict) else None
+        if not counted or counted[0] in selected:
+            continue
+        table, col = counted
+        name, n = col, 2
+        while name.lower() in taken:
+            name = f"{col} ({table})" if n == 2 else f"{col} ({table} {n - 1})"
+            n += 1
+        columns.append({"name": name, "column_id": f"{table}::{col}",
+                        "properties": {"column_type": "ATTRIBUTE"}})
+        selected.add(table)
+        taken.add(name.lower())
+        added.append(name)
+    return added
+
+
+def promote_duplicate_column_ids(
+    physical: list[dict],
+    formula_entries: list[dict],
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Keep every column_id unique (TML invariant I8) by re-expressing duplicate
+    physical columns as formulas.
+
+    When a source references one physical column both as a raw measure and as
+    an aggregate metric (e.g. ``F_TIME_TO_RESOLVE`` + ``AVG(TIMETORESOLVE__C)``),
+    the translate step emits two physical ``columns[]`` candidates with an
+    identical ``TABLE::col`` column_id. ThoughtSpot rejects that on import
+    ("columns should have unique column_id values"). This helper keeps the
+    first occurrence of each column_id as a physical column and promotes every
+    later occurrence to a formula:
+
+    - MEASURE with a mapped aggregation → ``fn ( [TABLE::col] )`` (I5's
+      COUNT_DISTINCT → ``unique count(...)`` is one row of the same map).
+    - Anything else (MEASURE with an unmapped aggregation, or two ATTRIBUTE
+      columns on one physical column) → left in place, so ``ts tml lint`` I8
+      still surfaces it rather than the builder either emitting a wrong formula
+      or silently masking a modelling mistake. Only an aggregate expressible as
+      a formula is promoted; a bare duplicate dimension is a lint finding for
+      the author to resolve.
+
+    Both builders call this AFTER ``resolve_name_collisions`` (so display-name
+    clashes are already settled) and BEFORE the formula-text pipeline (so a
+    promoted expr is prefixed/double-agg-checked like any other formula).
+
+    Each candidate is a builder dict carrying at least ``name`` (display title)
+    and ``entry`` (the translated column dict with ``table`` / ``column`` /
+    ``aggregation`` / ``column_type``), plus the builder's own source-name key
+    used to re-locate it during emission. A promoted candidate keeps that
+    source-name key and gains an ``expr`` key, so the builder's emit walk finds
+    it in ``formula_entries`` instead of ``physical``. Neither input list is
+    mutated; returns ``(kept_physical, formula_entries_with_promotions,
+    promoted_titles)``.
+    """
+    seen: set[str] = set()
+    kept: list[dict] = []
+    out_formulas = list(formula_entries)
+    promoted_titles: list[str] = []
+    for cand in physical:
+        entry = cand["entry"]
+        col_id = f"{entry['table']}::{entry['column']}"
+        expr = None
+        if col_id not in seen:
+            seen.add(col_id)
+            kept.append(cand)
+            continue
+        if entry.get("column_type") == "MEASURE":
+            expr = aggregate_formula(entry.get("aggregation") or "SUM", f"[{col_id}]")
+        if expr is None:
+            # Not an aggregate we can re-express as a formula (unmapped measure
+            # aggregation, or a bare duplicate dimension) — leave it in place so
+            # `ts tml lint` I8 surfaces it for the author to resolve.
+            kept.append(cand)
+            continue
+        # `fn ( [col] )` is an aggregate formula, so ThoughtSpot ignores the column's
+        # aggregation (product owner, 2026-11-02); SUM is the declared convention.
+        promoted_entry = dict(entry, aggregation="SUM")
+        out_formulas.append(dict(cand, entry=promoted_entry, expr=expr))
+        promoted_titles.append(cand["name"])
+    return kept, out_formulas, promoted_titles
+
+
+# ---------------------------------------------------------------------------
+# Formula cross-reference prefix
+# ---------------------------------------------------------------------------
+
+def add_formula_prefix(
+    expr: str,
+    formula_names: set[str],
+    parameter_names: set[str],
+) -> str:
+    """Rewrite [Name] → [formula_Name] for formula cross-references.
+
+    Skips table-qualified refs ([TABLE::COL]), parameter refs, and refs
+    that already have the formula_ prefix.
+    """
+    def _replace(m: re.Match) -> str:
+        ref = m.group(1)
+        if "::" in ref:
+            return m.group(0)
+        if ref in parameter_names:
+            return m.group(0)
+        if ref.startswith("formula_"):
+            return m.group(0)
+        if ref in formula_names:
+            return f"[formula_{ref}]"
+        return m.group(0)
+
+    return re.sub(r"\[([^\]]+)\]", _replace, expr)
+
+
+# ---------------------------------------------------------------------------
+# sql_*_op pass-through rewriting (BL-171)
+# ---------------------------------------------------------------------------
+
+def _split_top_level_args(inner: str) -> list[str]:
+    """Split a call's argument text on top-level commas (quote/paren aware; a ``[…]``
+    reference is opaque, so ``[Bob's]`` opens no literal — #583 review)."""
+    args: list[str] = []
+    depth, quote, cur = 0, None, []
+    for ch in inner:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"[":
+            quote = "]" if ch == "[" else ch
+            cur.append(ch)
+        elif ch in "({":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")}":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        args.append("".join(cur).strip())
+    return [a for a in args if a != ""]
+
+
+def _close_paren(text: str, open_idx: int) -> int:
+    """Index of the ')' matching the '(' at open_idx, or -1 (quote aware; ``[…]`` opaque)."""
+    depth, quote = 0, None
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"[":
+            quote = "]" if ch == "[" else ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """[(start, end)) index ranges covered by string literals.
+
+    Both quote styles matter: a ThoughtSpot literal is `'...'` and an
+    `sql_*_op` template is `"..."`, and a marker name can legitimately appear
+    inside either as *data* (`Replace(Name, 'upper(x)', 'y')`). Doubled quotes
+    (`'it''s'`, the escape ThoughtSpot uses) read as adjacent literals, which
+    keeps the inner text quoted — conservative in the safe direction. A ``[…]``
+    reference is a span too: its name is data, and an apostrophe in it opens nothing.
+    """
+    spans: list[tuple[int, int]] = []
+    quote: str | None = None
+    start = 0
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                spans.append((start, i + 1))
+                quote = None
+        elif ch in "'\"[":
+            quote = "]" if ch == "[" else ch
+            start = i
+    if quote:                      # unterminated literal — treat to end of text
+        spans.append((start, len(text)))
+    return spans
+
+
+def _in_quotes(idx: int, spans: list[tuple[int, int]]) -> bool:
+    return any(a <= idx < b for a, b in spans)
+
+
+#: Public names for the helpers above, for callers outside the converters (P19).
+split_top_level_args = _split_top_level_args
+close_paren = _close_paren
+quoted_spans = _quoted_spans
+in_quotes = _in_quotes
+
+
+def rewrite_marker_calls(
+    text: str,
+    handlers: dict[str, Any],
+) -> tuple[str, set[str]]:
+    """Rewrite `marker(args...)` calls via `handlers[marker](args) -> str|None`.
+
+    The single call-rewriting scanner shared by the regex-pipeline converters
+    (qlik, powerbi). `handlers` is keyed on a LOWERCASE marker name — the
+    intermediate name a converter's function map produces for something that
+    needs an argument-aware rewrite rather than a rename.
+
+    Two properties make it safe to run over its own output:
+
+    * **Quote-aware.** A marker inside a string literal is data, not a call —
+      `Replace(Name, 'upper(x)', 'y')` must not have its literal rewritten, and
+      an emitted `sql_string_op('TRIM({0})', …)` template must not be re-read as
+      a `trim` call. Both the marker search and the paren walk skip literals.
+    * **Terminating.** A handler's output must not itself contain the marker as
+      a callable token (pass-through templates are UPPERCASE inside quotes;
+      compositions emit a different function name), so each rewrite strictly
+      reduces the marker count while nested occurrences still resolve on the
+      following pass.
+
+    Returns ``(rewritten_text, unresolved)``. A handler returning None (wrong
+    arity, or a shape it cannot express) leaves the call untouched, and **any
+    marker still callable in the final text is reported in `unresolved`** —
+    including after an unbalanced-paren bail-out or guard exhaustion. Callers
+    must surface `unresolved` as NEEDS REVIEW: the surviving text is a bare
+    call to a function ThoughtSpot does not have, so shipping it silently would
+    trade a loud import failure for a wrong formula (flag, don't downgrade).
+    """
+    if not handlers:
+        return text, set()
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_])(" + "|".join(
+            sorted((re.escape(k) for k in handlers), key=len, reverse=True))
+        + r")\s*\(")
+    search_from = 0
+    guard = 0
+    while guard < 200:
+        guard += 1
+        spans = _quoted_spans(text)
+        m = None
+        for candidate in pattern.finditer(text, search_from):
+            if not _in_quotes(candidate.start(), spans):
+                m = candidate
+                break
+        if not m:
+            break
+        name = m.group(1)
+        open_idx = m.end() - 1
+        close_idx = _close_paren(text, open_idx)
+        if close_idx < 0:
+            break                          # unbalanced — final sweep flags it
+        args = _split_top_level_args(text[open_idx + 1:close_idx])
+        replacement = handlers[name](args)
+        if replacement is None:
+            search_from = m.end()          # final sweep flags it
+            continue
+        text = text[:m.start()] + replacement + text[close_idx + 1:]
+        search_from = m.start()
+    # Final sweep: whatever is still a callable marker outside a literal was
+    # not translated, whether through wrong arity, unbalanced parens or guard
+    # exhaustion. Reporting it is what keeps the failure loud.
+    spans = _quoted_spans(text)
+    unresolved = {m.group(1) for m in pattern.finditer(text)
+                  if not _in_quotes(m.start(), spans)}
+    return text, unresolved
+
+
+def _passthrough_handler(op: str, template: str, arity: int, quote: str) -> Any:
+    def handler(args: list[str]) -> str | None:
+        if len(args) != arity:
+            return None
+        return f"{op}({quote}{template}{quote}, " + ", ".join(args) + ")"
+    return handler
+
+
+def wrap_passthrough_calls(
+    text: str,
+    templates: dict[str, tuple[str, str, int]],
+    quote: str = '"',
+) -> tuple[str, set[str]]:
+    """Rewrite `fn(args...)` into a ThoughtSpot `sql_*_op` pass-through.
+
+    ``quote`` defaults to the DOUBLE-quoted outer template. It defaulted to a
+    single quote — a form nothing in this repo emits and nothing has verified
+    against the parser. Both live callers already override it, and
+    ``qlik/functions.py`` records why: taking the default made Qlik alone emit
+    the single-quoted form while its siblings and every example in the patterns
+    schema use the double-quoted one. A default reachable by omitting one keyword
+    argument, in the helper BL-171 created to stop emitting forms ThoughtSpot
+    rejects, is a trap rather than a convenience (audit 9.7).
+
+    BL-171: a converter that renames a source function to a ThoughtSpot name
+    which does not exist produces a formula rejected at import (error_code
+    14516). For the functions with no ThoughtSpot equivalent — `upper`,
+    `lower`, `trim`, `ltrim`, `rtrim`, `replace` (all live-disproved on
+    se-thoughtspot: 2026-06-13 for the first two, 2026-07-29/30 for the rest)
+    — the translation is a `sql_*_op` pass-through instead.
+
+    `templates` maps a LOWERCASE marker name to `(sql_op, sql_template,
+    arity)`, e.g. ``{"trim": ("sql_string_op", "TRIM({0})", 1)}``. A thin
+    wrapper over :func:`rewrite_marker_calls` — see there for the quoting and
+    termination guarantees, and for what `unresolved` obliges the caller to do.
+    """
+    return rewrite_marker_calls(
+        text,
+        {name: _passthrough_handler(op, template, arity, quote)
+         for name, (op, template, arity) in templates.items()},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Double-aggregation detection
+# ---------------------------------------------------------------------------
+
+_AGG_FUNCTIONS = re.compile(
+    r"\b(sum|average|count|unique\s+count|max|min|median|sum_if|count_if|"
+    r"average_if|unique_count_if|min_if|max_if|stddev_if|variance_if|"
+    r"cumulative_sum|cumulative_average|cumulative_max|cumulative_min|stddev|"
+    r"variance|moving_sum|moving_average|moving_max|moving_min|group_aggregate)\s*\(",
+    re.IGNORECASE,
+)
+
+# `formula_exprs` is keyed by the BARE pre-prefix name (snapshotted before
+# `add_formula_prefix` runs) — a ref's own text reads `[Rev]`, not
+# `[formula_Rev]`. Resolve a bracketed name against it, as-is or stripped.
+_BRACKET_REF_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def expr_is_aggregated(expr: str) -> bool:
+    """Check if an expression contains aggregation functions."""
+    return bool(_AGG_FUNCTIONS.search(expr))
+
+
+def _group_aggregate_spans(expr: str) -> list[tuple[int, int]]:
+    """Start/end offsets of each `group_aggregate(...)` call's own span."""
+    return [(m.start(), (_close_paren(expr, m.end() - 1) + 1) or len(expr))
+            for m in re.finditer(r"\bgroup_aggregate\s*\(", expr, re.IGNORECASE)]
+
+
+def _resolve_formula_ref(name: str, formula_exprs: dict[str, str]) -> str | None:
+    """Resolve a bracketed name to a `formula_exprs` key, as-is or `formula_`-stripped."""
+    stripped = name[8:] if name.lower().startswith("formula_") else None
+    return name if name in formula_exprs else stripped if stripped in formula_exprs else None
+
+
+def _has_naked_aggregate(
+    expr: str, formula_exprs: dict[str, str] | None = None, _seen: frozenset[str] = frozenset(),
+) -> bool:
+    """True if `expr` reaches an aggregate outside every `group_aggregate(...)` span,
+    inline or through `[Rev]` refs resolved against `formula_exprs` at any depth (a
+    refs-only `[P] / [Q]` counts). Such an `expr` is fully aggregated; with none it is
+    LOD-shaped or row-level. An unresolved ref counts as none; `_seen` guards a cycle.
+    """
+    formula_exprs = formula_exprs or {}
+    ga_spans = _group_aggregate_spans(expr)
+
+    def _outside(pos: int) -> bool:
+        return not any(start <= pos < end for start, end in ga_spans)
+
+    if any(m.group(1).lower() != "group_aggregate" and _outside(m.start())
+           for m in _AGG_FUNCTIONS.finditer(expr)):
+        return True
+    for m in _BRACKET_REF_RE.finditer(expr):
+        name = _resolve_formula_ref(m.group(1), formula_exprs) if _outside(m.start()) else None
+        if name is not None and name not in _seen and _has_naked_aggregate(
+                formula_exprs[name], formula_exprs, _seen | {name}):
+            return True
+    return False
+
+
+def fix_double_aggregation(
+    expr: str,
+    formula_exprs: dict[str, str],
+) -> str:
+    """Replace sum([formula_X]) with [formula_X] when X is already aggregated.
+
+    Handles sum, count, average, max, min and their _if variants. Does NOT
+    strip when X is LOD-shaped (see `_has_naked_aggregate`).
+    """
+    _WRAPPED_REF = re.compile(
+        r"\b(sum|average|count|max|min)\s*\(\s*\[formula_([^\]]+)\]\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _replace(m: re.Match) -> str:
+        ref_name = m.group(2)
+        ref_expr = formula_exprs.get(ref_name, "")
+        if expr_is_aggregated(ref_expr) and _has_naked_aggregate(ref_expr, formula_exprs):
+            return f"[formula_{ref_name}]"
+        return m.group(0)
+
+    return _WRAPPED_REF.sub(_replace, expr)
+
+
+# A single column reference, optionally qualified and/or double-quoted:
+#   COL   "COL"   tbl.COL   tbl."COL"   "tbl"."COL"
+_QUALIFIED_BARE_COLUMN_RE = re.compile(
+    r'^(?:(?P<tbl>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?'
+    r'(?P<col>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)$')
+
+
+def bare_column_name(expr: str | None, alias_table: str | None = None) -> str | None:
+    """Return the column an expression names, if it names exactly one column.
+
+    A rename is a COLUMN in ThoughtSpot, not a formula — `_translate_dimension`
+    requires at least one real column or the import cross-joins. The old pattern
+    only recognised the unqualified, unquoted form, mis-classifying a qualified,
+    quoted rename as computed (live, 2026-09-02, BL-212). A qualifier must match
+    `alias_table` case-insensitively, or this falls through to the formula path.
+    Returns the column name with quotes stripped, or None.
+    """
+    if not expr:
+        return None
+    m = _QUALIFIED_BARE_COLUMN_RE.match(expr.strip())
+    if not m:
+        return None
+    tbl = m.group("tbl")
+    if tbl is not None and alias_table is not None:
+        if tbl.strip('"').lower() != alias_table.strip('"').lower():
+            return None
+    return m.group("col").strip('"')
+
